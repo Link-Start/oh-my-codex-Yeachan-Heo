@@ -178,10 +178,16 @@ switch (command.command) {
 
 async function setupTeam(name: string, workerCount: number = 2): Promise<{ cwd: string; cleanup: () => Promise<void> }> {
   const cwd = await mkdtemp(join(tmpdir(), `omx-delivery-e2e-${name}-`));
+  const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
+  process.env.OMX_TEAM_STATE_ROOT = join(cwd, '.omx', 'state');
   await initTeamState(name, 'delivery smoke test', 'executor', workerCount, cwd);
   return {
     cwd,
-    cleanup: async () => await rm(cwd, { recursive: true, force: true }),
+    cleanup: async () => {
+      if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
+      await rm(cwd, { recursive: true, force: true });
+    },
   };
 }
 
@@ -555,13 +561,12 @@ describe('team message delivery end-to-end smoke tests', () => {
         const result = spawnSync(process.execPath, [watcherScript, '--once', '--cwd', cwd, '--notify-script', notifyHook], {
           encoding: 'utf-8',
           env: buildCleanNotifyEnv({
-            OMX_TEAM_WORKER_TURN_STALL_MS: '10000',
           }),
         });
         assert.equal(result.status, 0, result.stderr || result.stdout);
 
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-        assert.match(tmuxLog, /send-keys -t %95 -l Team stalled-worker-fresh-leader: worker panes stalled/);
+        assert.doesNotMatch(tmuxLog, /worker panes stalled/);
         assert.doesNotMatch(tmuxLog, /leader stale/);
       });
     } finally {

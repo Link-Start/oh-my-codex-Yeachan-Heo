@@ -12,6 +12,32 @@ async function loadRuntimeCliModule() {
 }
 
 describe('runtime-cli helpers', () => {
+  it('accepts inline JSON payloads without consuming stdin', async () => {
+    const runtimeCli = await loadRuntimeCliModule();
+    const base64Payload = Buffer.from(
+      '{"teamName":"alpha","task":"quote \\"this\\" & keep 100%"}',
+      'utf-8',
+    ).toString('base64url');
+
+    assert.equal(
+      runtimeCli.resolveRuntimeCliInlineInput(['--input-json', '{"teamName":"alpha"}']),
+      '{"teamName":"alpha"}',
+    );
+    assert.equal(
+      runtimeCli.resolveRuntimeCliInlineInput(['--input-json-base64', base64Payload]),
+      '{"teamName":"alpha","task":"quote \\"this\\" & keep 100%"}',
+    );
+    assert.equal(runtimeCli.resolveRuntimeCliInlineInput([]), null);
+    assert.throws(
+      () => runtimeCli.resolveRuntimeCliInlineInput(['--input-json']),
+      /Missing JSON payload for --input-json/,
+    );
+    assert.throws(
+      () => runtimeCli.resolveRuntimeCliInlineInput(['--input-json-base64']),
+      /Missing JSON payload for --input-json-base64/,
+    );
+  });
+
   it('normalizes per-worker providers and validates supported values', async () => {
     const runtimeCli = await loadRuntimeCliModule();
 
@@ -23,9 +49,66 @@ describe('runtime-cli helpers', () => {
       runtimeCli.normalizeAgentTypes(['gemini'], 3),
       ['gemini'],
     );
+    assert.equal(
+      runtimeCli.resolveRuntimeCliProviderMap(undefined, 2),
+      null,
+    );
+    assert.equal(
+      runtimeCli.resolveRuntimeCliProviderMap(['claude'], 2),
+      'claude',
+    );
+    assert.equal(
+      runtimeCli.resolveRuntimeCliAgentType(undefined),
+      'executor',
+    );
+    assert.equal(
+      runtimeCli.resolveRuntimeCliAgentType('test-engineer'),
+      'test-engineer',
+    );
+    assert.deepEqual(
+      runtimeCli.resolveRuntimeCliMissingFields({
+        teamName: 'alpha',
+        workerCount: 2,
+        tasks: [{ subject: 'task', description: 'desc' }],
+        cwd: '/tmp/repo',
+      }),
+      [],
+    );
+    assert.deepEqual(
+      runtimeCli.resolveRuntimeCliMissingFields({
+        teamName: 'alpha',
+        tasks: [{ subject: 'task', description: 'desc' }],
+        cwd: '/tmp/repo',
+      }),
+      ['workerCount or agentTypes'],
+    );
     assert.throws(
       () => runtimeCli.normalizeAgentTypes(['codex', 'invalid'], 2),
       /Expected codex\\|claude\\|gemini/,
+    );
+  });
+
+  it('prefers the explicit task transport over joined subtask subjects and falls back when absent', async () => {
+    const runtimeCli = await loadRuntimeCliModule();
+
+    assert.equal(
+      runtimeCli.resolveRuntimeCliTask({
+        task: 'Execute approved demo plan',
+        tasks: [
+          { subject: 'Implement runtime', description: 'Change runtime' },
+          { subject: 'Verify runtime', description: 'Cover runtime' },
+        ],
+      }),
+      'Execute approved demo plan',
+    );
+    assert.equal(
+      runtimeCli.resolveRuntimeCliTask({
+        tasks: [
+          { subject: 'Implement runtime', description: 'Change runtime' },
+          { subject: 'Verify runtime', description: 'Cover runtime' },
+        ],
+      }),
+      'Implement runtime; Verify runtime',
     );
   });
 
@@ -134,6 +217,35 @@ describe('runtime-cli helpers', () => {
     }
   });
 
+  it('does not auto-force failed-task shutdown without explicit issue confirmation', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-confirm-issues-'));
+    const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
+    delete process.env.OMX_TEAM_STATE_ROOT;
+    try {
+      await initTeamState('shutdown-confirm-required', 'task', 'executor', 1, cwd);
+      await createTask('shutdown-confirm-required', {
+        subject: 'failed task',
+        description: 'requires confirmation',
+        status: 'failed',
+      }, cwd);
+
+      const teamRoot = join(cwd, '.omx', 'state', 'team', 'shutdown-confirm-required');
+      assert.equal(existsSync(teamRoot), true);
+
+      const runtimeCli = await loadRuntimeCliModule();
+      await assert.rejects(
+        () => runtimeCli.shutdownWithForceFallback('shutdown-confirm-required', cwd),
+        /shutdown_confirm_issues_required:failed=1/,
+      );
+
+      assert.equal(existsSync(teamRoot), true);
+    } finally {
+      if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('does not auto-shutdown merely because monitorTeam reaches complete', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-complete-'));
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
@@ -165,7 +277,9 @@ describe('runtime-cli helpers', () => {
 
   it('preserves team state when building terminal output for completed teams', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-preserve-complete-'));
+    const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     try {
+      delete process.env.OMX_TEAM_STATE_ROOT;
       await initTeamState('runtime-cli-preserve-complete', 'task', 'executor', 1, cwd);
       await createTask('runtime-cli-preserve-complete', {
         subject: 'done task',
@@ -198,14 +312,19 @@ describe('runtime-cli helpers', () => {
       }]);
       assert.match(result.notice, /preserving team state/i);
       assert.match(result.notice, /omx team shutdown runtime-cli-preserve-complete/);
+      assert.match(result.notice, /omx team api read-stall-state/);
     } finally {
+      if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
   it('preserves team state when building terminal output for failed teams', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-preserve-failed-'));
+    const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     try {
+      delete process.env.OMX_TEAM_STATE_ROOT;
       await initTeamState('runtime-cli-preserve-failed', 'task', 'executor', 1, cwd);
       await createTask('runtime-cli-preserve-failed', {
         subject: 'failed task',
@@ -237,15 +356,20 @@ describe('runtime-cli helpers', () => {
         summary: 'FAIL: worker crashed',
       }]);
       assert.match(result.notice, /preserving team state/i);
+      assert.match(result.notice, /omx team api read-stall-state/);
       assert.match(result.notice, /omx team shutdown runtime-cli-preserve-failed/);
     } finally {
+      if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
   it('reports cancelled terminal phases without deleting team state', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-preserve-cancelled-'));
+    const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     try {
+      delete process.env.OMX_TEAM_STATE_ROOT;
       await initTeamState('runtime-cli-preserve-cancelled', 'task', 'executor', 1, cwd);
       await createTask('runtime-cli-preserve-cancelled', {
         subject: 'cancelled task',
@@ -271,6 +395,8 @@ describe('runtime-cli helpers', () => {
       assert.match(result.notice, /phase=cancelled/);
       assert.match(result.notice, /omx team shutdown runtime-cli-preserve-cancelled/);
     } finally {
+      if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(cwd, { recursive: true, force: true });
     }
   });

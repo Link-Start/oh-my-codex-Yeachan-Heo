@@ -5,6 +5,7 @@ import { appendFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink, w
 import { spawnSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { homedir } from 'os';
+import { StringDecoder } from 'string_decoder';
 import { spawnPlatformCommandSync } from '../utils/platform-command.js';
 import { drainPendingTeamDispatch } from './notify-hook/team-dispatch.js';
 import {
@@ -15,6 +16,9 @@ import {
   normalizeAutoNudgeSignatureText,
   resolveAutoNudgeSignature,
 } from './notify-hook/auto-nudge.js';
+import {
+  readScopedJsonIfExists,
+} from './notify-hook/state-io.js';
 import { checkPaneReadyForTeamSendKeys } from './notify-hook/team-tmux-guard.js';
 import {
   checkWorkerPanesAlive,
@@ -22,13 +26,19 @@ import {
   maybeNudgeTeamLeader,
   resolveLeaderStalenessThresholdMs,
 } from './notify-hook/team-leader-nudge.js';
+import { resolveManagedPaneFromAnchor, resolveManagedSessionPane } from './notify-hook/managed-tmux.js';
 import { DEFAULT_MARKER } from './tmux-hook-engine.js';
 import { isTerminalPhase } from './notify-hook/utils.js';
-import { isSessionStale, readSessionState } from '../hooks/session.js';
+import { isSessionStale, isSessionStateAuthoritativeForCwd, readSessionState } from '../hooks/session.js';
 import {
   DEFAULT_SUBAGENT_ACTIVE_WINDOW_MS,
   readSubagentSessionSummary,
 } from '../subagents/tracker.js';
+import { listNotifyCanonicalActiveTeams } from './notify-hook/active-team.js';
+import { sameFilePath } from '../utils/paths.js';
+import { validateSessionId } from '../mcp/state-paths.js';
+import { TEAM_NAME_SAFE_PATTERN } from '../team/contracts.js';
+import { shouldContinueRun } from '../runtime/run-loop.js';
 
 function argValue(name: string, fallback = ''): string {
   const idx = process.argv.indexOf(name);
@@ -43,6 +53,21 @@ function asNumber(value: string | number | undefined, fallback: number): number 
 
 function safeString(v: unknown): string {
   return typeof v === 'string' ? v : '';
+}
+
+function normalizeValidSessionId(value: unknown): string {
+  const trimmed = safeString(value).trim();
+  if (!trimmed) return '';
+  try {
+    return validateSessionId(trimmed) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function normalizeValidTeamName(value: unknown): string {
+  const trimmed = safeString(value).trim();
+  return TEAM_NAME_SAFE_PATTERN.test(trimmed) ? trimmed : '';
 }
 
 function parsePositivePid(value: unknown): number | null {
@@ -67,6 +92,19 @@ function isPidAlive(pid: number): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+let atomicJsonWriteCounter = 0;
+
+async function writeJsonObjectAtomically(path: string, value: unknown): Promise<void> {
+  const tempPath = `${path}.${process.pid}.${Date.now()}.${++atomicJsonWriteCounter}.tmp`;
+  try {
+    await writeFile(tempPath, JSON.stringify(value, null, 2));
+    await rename(tempPath, path);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 async function waitForPidExit(pid: number, timeoutMs = 3000, stepMs = 50): Promise<boolean> {
@@ -104,7 +142,8 @@ const maxLifetimeMs = runOnce
     )
   );
 
-const omxDir = join(cwd, '.omx');
+const runtimeRoot = resolve(process.env.OMX_ROOT || process.env.OMX_STATE_ROOT || cwd);
+const omxDir = join(runtimeRoot, '.omx');
 const logsDir = join(omxDir, 'logs');
 const stateDir = join(omxDir, 'state');
 const statePath = join(stateDir, 'notify-fallback-state.json');
@@ -123,7 +162,8 @@ const watcherOwnerToken = `${process.pid}-${startedAt}-${Math.random().toString(
 const RALPH_CONTINUE_TEXT = 'Ralph loop active continue';
 const RALPH_CONTINUE_CADENCE_MS = 60_000;
 const RALPH_STEER_LOCK_STALE_MS = 30_000;
-const RALPH_TERMINAL_PHASES = new Set(['complete', 'failed', 'cancelled']);
+const RALPH_TERMINAL_PHASES = new Set(['blocked_on_user', 'complete', 'failed', 'cancelled']);
+const RALPH_STARTING_PHASE_TIMEOUT_MS = RALPH_CONTINUE_CADENCE_MS * 2;
 const QUIET_ONCE_EVENT_TYPES = new Set(['watcher_start', 'watcher_once_complete']);
 
 interface WatcherFileMeta {
@@ -131,6 +171,7 @@ interface WatcherFileMeta {
   offset: number;
   size: number;
   partial: string;
+  decoder: StringDecoder;
 }
 
 interface RalphContinueSteerState {
@@ -451,10 +492,20 @@ function normalizeRalphContinueSteerState(raw: Record<string, unknown> | null | 
 function hasRalphTerminalState(raw: Record<string, unknown> | null | undefined): boolean {
   if (!raw || typeof raw !== 'object') return true;
   if (raw.active !== true) return true;
+  if (!shouldContinueRun(raw)) return true;
   const phase = safeString(raw.current_phase).trim().toLowerCase();
   if (phase && RALPH_TERMINAL_PHASES.has(phase)) return true;
+  if (isStaleRalphStartingPhase(raw)) return true;
   if (safeString(raw.completed_at).trim()) return true;
   return false;
+}
+
+function isStaleRalphStartingPhase(raw: Record<string, unknown>): boolean {
+  const phase = safeString(raw.current_phase).trim().toLowerCase();
+  if (phase !== 'starting') return false;
+  const reference = parseIsoMillis(safeString(raw.last_turn_at)) ?? parseIsoMillis(safeString(raw.started_at));
+  if (reference === null) return false;
+  return Date.now() - reference > RALPH_STARTING_PHASE_TIMEOUT_MS;
 }
 
 async function loadPersistedWatcherState(): Promise<void> {
@@ -507,8 +558,10 @@ async function resolveActiveModeState(mode: string): Promise<ActiveModeResult> {
   let currentSessionIsLive = false;
   const session = await readSessionState(cwd);
   if (session?.session_id) {
-    currentSessionId = safeString(session.session_id).trim();
-    currentSessionIsLive = !isSessionStale(session);
+    if (isSessionStateAuthoritativeForCwd(session, cwd)) {
+      currentSessionId = normalizeValidSessionId(session.session_id);
+      currentSessionIsLive = currentSessionId !== '' && !isSessionStale(session);
+    }
     if (currentSessionId && currentSessionIsLive) {
       candidateDirs.push(join(stateDir, 'sessions', currentSessionId));
     }
@@ -531,6 +584,14 @@ async function resolveActiveModeState(mode: string): Promise<ActiveModeResult> {
       .then((content) => JSON.parse(content) as Record<string, unknown>)
       .catch(() => null);
     if (!parsed || typeof parsed !== 'object') continue;
+    if (mode === 'ralph' && dir !== stateDir && isStaleRalphStartingPhase(parsed)) {
+      return {
+        active: false,
+        reason: 'starting_stale',
+        path,
+        state: parsed,
+      };
+    }
     if (hasRalphTerminalState(parsed)) {
       return {
         active: false,
@@ -561,19 +622,23 @@ async function resolveActiveRalphState(): Promise<ActiveModeResult> {
 
 async function resolveActiveTeamState(): Promise<ActiveTeamResult> {
   const candidateDirs: string[] = [];
-  const sessionPath = join(stateDir, 'session.json');
-  try {
-    const session = JSON.parse(await readFile(sessionPath, 'utf-8')) as Record<string, unknown>;
-    const sessionId = safeString(session?.session_id).trim();
-    if (sessionId) {
-      candidateDirs.push(join(stateDir, 'sessions', sessionId));
+  let currentSessionId = '';
+  let currentSessionIsLive = false;
+  const session = await readSessionState(cwd);
+  if (session?.session_id) {
+    currentSessionId = normalizeValidSessionId(session.session_id);
+    currentSessionIsLive = currentSessionId !== '' && !isSessionStale(session);
+    if (currentSessionId && currentSessionIsLive) {
+      candidateDirs.push(join(stateDir, 'sessions', currentSessionId));
     }
-  } catch {
-    // No active session file; fall back to root state only.
   }
   if (!candidateDirs.includes(stateDir)) candidateDirs.push(stateDir);
 
   for (const dir of candidateDirs) {
+    if (dir === stateDir && currentSessionId) {
+      continue;
+    }
+
     const path = join(dir, 'team-state.json');
     if (!existsSync(path)) continue;
     const parsed = await readFile(path, 'utf-8')
@@ -581,7 +646,7 @@ async function resolveActiveTeamState(): Promise<ActiveTeamResult> {
       .catch(() => null);
     if (!parsed || typeof parsed !== 'object' || parsed.active !== true) continue;
 
-    const teamName = safeString(parsed.team_name).trim();
+    const teamName = normalizeValidTeamName(parsed.team_name);
     if (!teamName) continue;
 
     const teamConfigDir = join(stateDir, 'team', teamName);
@@ -619,6 +684,54 @@ async function resolveActiveTeamState(): Promise<ActiveTeamResult> {
       state: parsed,
       team_name: teamName,
       pane_count: paneStatus.paneCount,
+    };
+  }
+
+  const canonicalFallbackTeams = await listNotifyCanonicalActiveTeams(cwd, currentSessionId).catch(() => []);
+  for (const team of canonicalFallbackTeams) {
+    const teamName = normalizeValidTeamName(team.teamName);
+    if (!teamName) continue;
+    const teamConfigDir = join(stateDir, 'team', teamName);
+    const manifestPath = join(teamConfigDir, 'manifest.v2.json');
+    const configPath = join(teamConfigDir, 'config.json');
+    const teamConfigPath = existsSync(manifestPath) ? manifestPath : configPath;
+    const teamConfig = existsSync(teamConfigPath)
+      ? await readFile(teamConfigPath, 'utf-8')
+        .then((content) => JSON.parse(content) as Record<string, unknown>)
+        .catch(() => null)
+      : null;
+    const tmuxSession = safeString(teamConfig?.tmux_session).trim();
+    if (!tmuxSession) continue;
+
+    const workers = Array.isArray(teamConfig?.workers) ? teamConfig.workers as Array<Record<string, unknown>> : [];
+    const workerPaneIds: string[] = workers
+      .map((worker) => safeString(worker?.pane_id).trim())
+      .filter(Boolean);
+    const paneStatus = await checkWorkerPanesAlive(tmuxSession, workerPaneIds as any);
+    if (!paneStatus.alive) continue;
+
+    return {
+      active: true,
+      reason: team.source,
+      path: team.path,
+      state: {
+        active: true,
+        team_name: teamName,
+        current_phase: team.phase,
+      },
+      team_name: teamName,
+      pane_count: paneStatus.paneCount,
+    };
+  }
+
+  if (currentSessionId) {
+    return {
+      active: false,
+      reason: currentSessionIsLive ? 'blocked_by_current_session' : 'stale_current_session',
+      path: '',
+      state: null,
+      team_name: '',
+      pane_count: 0,
     };
   }
 
@@ -680,10 +793,13 @@ async function readRalphSteerLock(path: string): Promise<RalphSteerLockRecord | 
   }
 }
 
+const RALPH_STEER_LOCK_MAX_RETRIES = 5;
+
 async function withRalphSteerLock<T>(task: () => Promise<T>): Promise<T | null> {
   await mkdir(dirname(ralphSteerLockPath), { recursive: true }).catch(() => {});
 
-  while (true) {
+  let acquired = false;
+  for (let attempt = 0; attempt < RALPH_STEER_LOCK_MAX_RETRIES; attempt++) {
     let handle;
     try {
       handle = await open(ralphSteerLockPath, 'wx');
@@ -692,6 +808,7 @@ async function withRalphSteerLock<T>(task: () => Promise<T>): Promise<T | null> 
         acquired_at: new Date().toISOString(),
       };
       await handle.writeFile(JSON.stringify(payload, null, 2));
+      acquired = true;
       break;
     } catch (error) {
       const code = error !== null && typeof error === 'object' ? (error as NodeJS.ErrnoException).code : '';
@@ -709,6 +826,11 @@ async function withRalphSteerLock<T>(task: () => Promise<T>): Promise<T | null> 
     } finally {
       await handle?.close().catch(() => {});
     }
+  }
+
+  if (!acquired) {
+    lastRalphContinueSteer.last_reason = 'global_lock_exhausted';
+    return null;
   }
 
   try {
@@ -750,7 +872,7 @@ async function readRalphProgressGate(
     }
   }
 
-  const hudState = await readJsonObject(join(stateDir, 'hud-state.json'));
+  const hudState = await readScopedJsonIfExists(stateDir, 'hud-state.json', undefined, null);
   if (!hudState || typeof hudState !== 'object') {
     return { allow: false, reason: 'progress_missing', progress_at: '', subagent_session_id: subagentSessionId };
   }
@@ -772,18 +894,18 @@ async function readRalphProgressGate(
   return { allow: true, reason: 'progress_stale', progress_at: progressAt, subagent_session_id: subagentSessionId };
 }
 
-function shouldSkipRalphContinue(now: number, candidateIso: string, startupIso: string): { skip: boolean; reason: string; anchorMs: number; anchorIso: string } {
+function shouldSkipRalphContinue(now: number, candidateIso: string): { skip: boolean; reason: string; anchorMs: number; anchorIso: string } {
   const sharedMs = parseIsoMillis(candidateIso);
   const localMs = parseIsoMillis(lastRalphContinueSteer.last_sent_at);
-  const startupAnchorIso = lastRalphContinueSteer.cooldown_anchor_at || startupIso;
+  const startupAnchorIso = lastRalphContinueSteer.cooldown_anchor_at;
   const startupAnchorMs = parseIsoMillis(startupAnchorIso);
-  const startupCooldown = sharedMs === null && localMs === null;
-  const anchorMs = sharedMs ?? localMs ?? startupAnchorMs ?? startedAt;
+  const startupCooldown = sharedMs === null && localMs === null && startupAnchorMs !== null;
+  const anchorMs = sharedMs ?? localMs ?? startupAnchorMs ?? 0;
   const anchorIso = sharedMs !== null
     ? candidateIso
     : (localMs !== null ? lastRalphContinueSteer.last_sent_at : startupAnchorIso);
   return {
-    skip: now - anchorMs < RALPH_CONTINUE_CADENCE_MS,
+    skip: anchorMs > 0 && now - anchorMs < RALPH_CONTINUE_CADENCE_MS,
     reason: startupCooldown ? 'startup_cooldown' : (sharedMs !== null ? 'global_cooldown' : 'cooldown'),
     anchorMs,
     anchorIso,
@@ -853,7 +975,7 @@ async function resolveAuthorityPrimaryWatcherHealth(now = Date.now()): Promise<A
 
   const existingRecord = await readPidFileRecord(pidFilePath).catch(() => null);
   if (!existingRecord) return createAuthorityBackoffState('pid_missing');
-  if (existingRecord.cwd && resolve(existingRecord.cwd) !== cwd) return createAuthorityBackoffState('cwd_mismatch');
+  if (existingRecord.cwd && !sameFilePath(existingRecord.cwd, cwd)) return createAuthorityBackoffState('cwd_mismatch');
   if (!isPidAlive(existingRecord.pid)) {
     return createAuthorityBackoffState('pid_stale', {
       primary_pid: existingRecord.pid,
@@ -926,10 +1048,93 @@ async function writePidFileRecord(): Promise<void> {
   await writeFile(pidFilePath, JSON.stringify(nextRecord, null, 2)).catch(() => {});
 }
 
+async function buildWatcherManagedPayload(): Promise<Record<string, string> | null> {
+  const session = await readSessionState(cwd).catch(() => null);
+  const sessionId = safeString(session?.session_id).trim();
+  if (!sessionId || !session || isSessionStale(session)) return null;
+  return { session_id: sessionId };
+}
+
+async function persistReboundRalphPaneState(
+  statePath: string,
+  state: Record<string, unknown> | null,
+  paneId: string,
+  nowIso: string,
+): Promise<Record<string, unknown>> {
+  const latestState = await readFile(statePath, 'utf-8')
+    .then((content) => JSON.parse(content) as Record<string, unknown>)
+    .catch(() => null);
+  const nextState = {
+    ...((latestState && typeof latestState === 'object') ? latestState : (state || {})),
+    tmux_pane_id: paneId,
+    tmux_pane_set_at: nowIso,
+  };
+  const tmpPath = `${statePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
+  await writeFile(tmpPath, JSON.stringify(nextState, null, 2));
+  try {
+    await rename(tmpPath, statePath);
+  } catch (error) {
+    await unlink(tmpPath).catch(() => {});
+    throw error;
+  }
+  return nextState;
+}
+
+async function resolveRalphContinuePaneTarget(
+  activeRalph: ActiveModeResult,
+  nowIso: string,
+): Promise<{ paneId: string; state: Record<string, unknown> | null; reboundFrom: string }> {
+  const currentState = activeRalph.state && typeof activeRalph.state === 'object'
+    ? activeRalph.state as Record<string, unknown>
+    : null;
+  const anchorPaneId = safeString(currentState?.tmux_pane_id).trim();
+  if (!anchorPaneId) {
+    return {
+      paneId: '',
+      state: currentState,
+      reboundFrom: '',
+    };
+  }
+
+  const managedPayload = await buildWatcherManagedPayload();
+  if (!managedPayload) {
+    return {
+      paneId: anchorPaneId,
+      state: currentState,
+      reboundFrom: '',
+    };
+  }
+
+  let resolvedPaneId = await resolveManagedPaneFromAnchor(anchorPaneId, cwd, managedPayload, { allowTeamWorker: false });
+  if (!resolvedPaneId) {
+    resolvedPaneId = await resolveManagedSessionPane(cwd, managedPayload);
+  }
+  if (!resolvedPaneId) {
+    return {
+      paneId: '',
+      state: currentState,
+      reboundFrom: '',
+    };
+  }
+  if (resolvedPaneId === anchorPaneId) {
+    return {
+      paneId: resolvedPaneId,
+      state: currentState,
+      reboundFrom: '',
+    };
+  }
+
+  const updatedState = await persistReboundRalphPaneState(activeRalph.path, currentState, resolvedPaneId, nowIso);
+  return {
+    paneId: resolvedPaneId,
+    state: updatedState,
+    reboundFrom: anchorPaneId,
+  };
+}
+
 async function runRalphContinueSteerTick(): Promise<void> {
   const now = Date.now();
   const nowIso = new Date(now).toISOString();
-  const startupIso = new Date(startedAt).toISOString();
   const activeRalph = await resolveActiveRalphState();
   const activePaneId = safeString(activeRalph.state?.tmux_pane_id).trim();
   lastRalphContinueSteer = {
@@ -948,15 +1153,16 @@ async function runRalphContinueSteerTick(): Promise<void> {
     singleton_lock_path: ralphSteerLockPath,
   };
 
-  if (!activeRalph.active) return;
-
-  if (parseIsoMillis(lastRalphContinueSteer.last_sent_at) === null && parseIsoMillis(lastRalphContinueSteer.cooldown_anchor_at) === null) {
-    lastRalphContinueSteer.cooldown_anchor_at = startupIso;
+  if (!activeRalph.active) {
+    if (activeRalph.reason === 'starting_stale') {
+      lastRalphContinueSteer.last_reason = 'starting_stale';
+    }
+    return;
   }
 
   const sharedBeforeLock = await readRalphSteerTimestamp();
   lastRalphContinueSteer.shared_last_sent_at = sharedBeforeLock;
-  const initialCooldown = shouldSkipRalphContinue(now, sharedBeforeLock, startupIso);
+  const initialCooldown = shouldSkipRalphContinue(now, sharedBeforeLock);
   if (initialCooldown.skip) {
     lastRalphContinueSteer.last_reason = initialCooldown.reason;
     if (!sharedBeforeLock && initialCooldown.reason === 'startup_cooldown') {
@@ -968,7 +1174,7 @@ async function runRalphContinueSteerTick(): Promise<void> {
   const outcome = await withRalphSteerLock(async () => {
     const sharedLastSentAt = await readRalphSteerTimestamp();
     lastRalphContinueSteer.shared_last_sent_at = sharedLastSentAt;
-    const cooldown = shouldSkipRalphContinue(Date.now(), sharedLastSentAt, startupIso);
+    const cooldown = shouldSkipRalphContinue(Date.now(), sharedLastSentAt);
     if (cooldown.skip) {
       lastRalphContinueSteer.last_reason = cooldown.reason;
       if (!sharedLastSentAt && cooldown.reason === 'startup_cooldown') {
@@ -985,7 +1191,9 @@ async function runRalphContinueSteerTick(): Promise<void> {
       return { sent: false, skipped: true };
     }
 
-    const paneId = safeString(activeRalph.state?.tmux_pane_id).trim();
+    const resolvedPane = await resolveRalphContinuePaneTarget(activeRalph, nowIso);
+    activeRalph.state = resolvedPane.state;
+    const paneId = resolvedPane.paneId;
     if (!paneId) {
       lastRalphContinueSteer.last_reason = 'pane_missing';
       lastRalphContinueSteer.pane_id = '';
@@ -1010,6 +1218,7 @@ async function runRalphContinueSteerTick(): Promise<void> {
       type: 'ralph_continue_steer',
       reason: 'sent',
       pane_id: paneId,
+      rebound_from: resolvedPane.reboundFrom || null,
       state_path: activeRalph.path,
       current_phase: safeString(activeRalph.state?.current_phase) || null,
       cadence_ms: RALPH_CONTINUE_CADENCE_MS,
@@ -1141,7 +1350,7 @@ async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
     },
     ...extra,
   };
-  await writeFile(statePath, JSON.stringify(state, null, 2)).catch(() => {});
+  await writeJsonObjectAtomically(statePath, state).catch(() => {});
 }
 
 async function writeAuthorityBackoffState(): Promise<void> {
@@ -1150,7 +1359,7 @@ async function writeAuthorityBackoffState(): Promise<void> {
   const state = existing && typeof existing === 'object'
     ? { ...existing, authority_backoff: lastAuthorityBackoff }
     : { authority_backoff: lastAuthorityBackoff };
-  await writeFile(statePath, JSON.stringify(state, null, 2)).catch(() => {});
+  await writeJsonObjectAtomically(statePath, state).catch(() => {});
 }
 
 async function readJsonObject(path: string): Promise<Record<string, unknown> | null> {
@@ -1160,19 +1369,18 @@ async function readJsonObject(path: string): Promise<Record<string, unknown> | n
 }
 
 async function readAutoNudgeCount(): Promise<number> {
-  const parsed = await readJsonObject(join(stateDir, 'auto-nudge-state.json'));
+  const parsed = await readScopedJsonIfExists(stateDir, 'auto-nudge-state.json', undefined, null);
   return Math.max(0, Math.trunc(asNumber(parsed?.nudgeCount as string | number | undefined, 0)));
 }
 
 async function readAutoNudgeState(): Promise<Record<string, unknown> | null> {
-  return readJsonObject(join(stateDir, 'auto-nudge-state.json'));
+  return readScopedJsonIfExists(stateDir, 'auto-nudge-state.json', undefined, null);
 }
 
 async function runFallbackAutoNudgeTick(): Promise<void> {
   const now = Date.now();
   const nowIso = new Date(now).toISOString();
-  const hudStatePath = join(stateDir, 'hud-state.json');
-  const hudState = await readJsonObject(hudStatePath);
+  const hudState = await readScopedJsonIfExists(stateDir, 'hud-state.json', undefined, null);
 
   lastFallbackAutoNudge = {
     ...lastFallbackAutoNudge,
@@ -1441,8 +1649,12 @@ async function invokeNotifyHook(payload: Record<string, unknown>, filePath: stri
   const result = spawnSync(process.execPath, [notifyScript, JSON.stringify(payload)], {
     cwd,
     encoding: 'utf-8',
-      windowsHide: true,
-    });
+    env: {
+      ...process.env,
+      OMX_NOTIFY_HOOK_TRUSTED_MANAGED_CWD: cwd,
+    },
+    windowsHide: true,
+  });
   const ok = result.status === 0;
   await eventLog({
     type: 'fallback_notify',
@@ -1491,9 +1703,11 @@ async function ensureTrackedFiles(): Promise<void> {
     const line = await readFirstLine(path).catch(() => '');
     const threadId = shouldTrackSessionMeta(line);
     if (!threadId) continue;
-    const size = (await stat(path).catch(() => ({ size: 0 }))).size || 0;
+    const fileStat = await stat(path).catch(() => null);
+    if (!fileStat) continue;
+    const size = fileStat.size || 0;
     const offset = runOnce ? 0 : size;
-    fileState.set(path, { threadId, offset, size, partial: '' });
+    fileState.set(path, { threadId, offset, size, partial: '', decoder: new StringDecoder('utf8') });
   }
 }
 
@@ -1506,15 +1720,54 @@ function splitBufferedLines(partial: string, delta: string): { lines: string[]; 
   };
 }
 
+async function readFileDelta(
+  path: string,
+  offset: number,
+  currentSize: number,
+): Promise<{ bytes: Buffer; nextOffset: number }> {
+  const length = currentSize - offset;
+  if (length <= 0) return { bytes: Buffer.alloc(0), nextOffset: offset };
+  const handle = await open(path, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(length);
+    let totalBytesRead = 0;
+    while (totalBytesRead < length) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        totalBytesRead,
+        length - totalBytesRead,
+        offset + totalBytesRead,
+      );
+      if (bytesRead === 0) break;
+      totalBytesRead += bytesRead;
+    }
+    return {
+      bytes: buffer.subarray(0, totalBytesRead),
+      nextOffset: offset + totalBytesRead,
+    };
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
 async function pollFiles(): Promise<number> {
   let processedCount = 0;
   for (const [path, meta] of fileState.entries()) {
-    const currentSize = (await stat(path).catch(() => ({ size: 0 }))).size || 0;
+    const fileStat = await stat(path).catch(() => null);
+    if (!fileStat) continue;
+    const currentSize = fileStat.size || 0;
+    if (currentSize < meta.offset) {
+      meta.offset = 0;
+      meta.partial = '';
+      meta.decoder = new StringDecoder('utf8');
+    }
     if (currentSize <= meta.offset) continue;
-    const content = await readFile(path, 'utf-8').catch(() => '');
-    if (!content) continue;
-    const delta = content.slice(meta.offset);
-    meta.offset = currentSize;
+    const read = await readFileDelta(path, meta.offset, currentSize).catch(() => null);
+    if (!read || read.bytes.length === 0) continue;
+    const { bytes, nextOffset } = read;
+    meta.offset = nextOffset;
+    const delta = meta.decoder.write(bytes);
+    if (!delta) continue;
     const buffered = splitBufferedLines(meta.partial, delta);
     const lines = buffered.lines;
     meta.partial = buffered.partial;
@@ -1641,8 +1894,8 @@ async function runDispatchDrainTick(): Promise<boolean> {
 
 async function shouldSuppressInteractiveFallbackTicks(): Promise<boolean> {
   const [deepInterviewStateActive, deepInterviewInputLockActive] = await Promise.all([
-    isDeepInterviewStateActive(stateDir),
-    isDeepInterviewInputLockActive(stateDir),
+    isDeepInterviewStateActive(stateDir, undefined),
+    isDeepInterviewInputLockActive(stateDir, undefined),
   ]);
   return deepInterviewStateActive || deepInterviewInputLockActive;
 }
@@ -1710,10 +1963,15 @@ function shutdown(signal: string): void {
 }
 
 async function main(): Promise<void> {
+  if (process.env.NODE_ENV === 'test' && process.env.OMX_NOTIFY_FALLBACK_TEST_FATAL === '1') {
+    throw new Error('test fatal notify fallback failure');
+  }
   await mkdir(logsDir, { recursive: true }).catch(() => {});
   await mkdir(stateDir, { recursive: true }).catch(() => {});
   if (!existsSync(notifyScript)) {
+    const reason = `notify script missing: ${notifyScript}`;
     await eventLog({ type: 'watcher_error', reason: 'notify_script_missing', notify_script: notifyScript });
+    process.stderr.write(`notify-fallback-watcher: ${reason}\n`);
     process.exit(1);
   }
 
@@ -1753,10 +2011,12 @@ async function main(): Promise<void> {
 
 main().catch(async (err) => {
   await mkdir(dirname(logPath), { recursive: true }).catch(() => {});
+  const message = err instanceof Error ? err.message : safeString(err);
   await eventLog({
     type: 'watcher_error',
     reason: 'fatal',
-    error: err instanceof Error ? err.message : safeString(err),
+    error: message,
   });
+  process.stderr.write(`notify-fallback-watcher: fatal: ${message || 'unknown error'}\n`);
   process.exit(1);
 });

@@ -2,12 +2,23 @@
 
 OMX supports an additive hooks extension point for user plugins under `.omx/hooks/*.mjs`.
 
+The official packaged Codex plugin at `plugins/oh-my-codex` also ships plugin-scoped
+companion metadata files (`.mcp.json`, `.app.json`) so the plugin bundle describes those
+surfaces from inside the plugin root. Native/runtime hooks are intentionally separate:
+they stay on the runtime/config side (`.codex/hooks.json` plus `.omx/hooks/*.mjs`) rather
+than inside the installable plugin manifest.
+
 Native Codex hook ownership is documented separately in
 [Codex native hook mapping](./codex-native-hooks.md). In short:
 
 - `.codex/hooks.json` = native Codex hook registrations installed by `omx setup`
 - `.omx/hooks/*.mjs` = OMX plugin hooks dispatched by runtime/native events
 - `omx tmux-hook` / notify-hook / derived watcher = tmux/runtime fallback surfaces
+
+`omx setup` treats `.codex/hooks.json` as a shared-ownership file: it refreshes only the OMX-managed
+wrapper entries that invoke `dist/scripts/codex-native-hook.js` and preserves user hook entries in the
+same file. `omx uninstall` removes only those OMX-managed wrappers and leaves `.codex/hooks.json` in
+place when user hooks remain.
 
 > Compatibility guarantee: `omx tmux-hook` remains fully supported and unchanged.
 > The new `omx hooks` command group is additive and does **not** replace tmux-hook workflows.
