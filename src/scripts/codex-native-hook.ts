@@ -1,5 +1,5 @@
 import { execFileSync } from "child_process";
-import { closeSync, existsSync, openSync, readFileSync, readSync } from "fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "fs";
 import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "fs/promises";
 import { extname, join, relative, resolve } from "path";
 import { pathToFileURL } from "url";
@@ -214,6 +214,57 @@ function safeContextSnippet(value: unknown, maxLength = 300): string {
   const text = safeString(value).replace(/\s+/g, " ").trim();
   if (text.length <= maxLength) return text;
   return `${text.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+const SIDE_CONVERSATION_BOUNDARY_PATTERNS = [
+  /side conversation boundary/i,
+  /inherited history from the parent thread/i,
+  /reference context only/i,
+  /only messages submitted after this boundary are active/i,
+  /side-conversation assistant/i,
+] as const;
+
+function textHasSideConversationBoundary(text: string): boolean {
+  return SIDE_CONVERSATION_BOUNDARY_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function isLikelySideConversationStopPayload(payload: CodexHookPayload): boolean {
+  const payloadText = [
+    payload.prompt,
+    payload.user_prompt,
+    payload.userPrompt,
+    payload.input,
+    payload.last_user_message,
+    payload.lastUserMessage,
+    payload.last_assistant_message,
+    payload.lastAssistantMessage,
+  ].map(safeString).join("\n");
+  if (textHasSideConversationBoundary(payloadText)) return true;
+
+  const transcriptPath = safeString(payload.transcript_path ?? payload.transcriptPath).trim();
+  if (!transcriptPath || !existsSync(transcriptPath)) return false;
+
+  try {
+    const maxBytes = 256 * 1024;
+    const stats = statSync(transcriptPath);
+    const fd = openSync(transcriptPath, "r");
+    try {
+      const bytesToRead = Math.min(maxBytes, Math.max(0, stats.size));
+      const buffer = Buffer.alloc(bytesToRead);
+      const position = Math.max(0, stats.size - bytesToRead);
+      const bytesRead = readSync(fd, buffer, 0, bytesToRead, position);
+      return textHasSideConversationBoundary(buffer.toString("utf-8", 0, bytesRead));
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+function shouldSuppressParentWorkflowStopForSideConversation(payload: CodexHookPayload): boolean {
+  if (safeString(payload.hook_event_name ?? payload.hookEventName).trim() !== "Stop") return false;
+  return isLikelySideConversationStopPayload(payload);
 }
 
 interface NativeSubagentSessionStartMetadata {
@@ -2657,9 +2708,23 @@ function readPreToolUsePathCandidates(payload: CodexHookPayload): string[] {
   return candidates.map((candidate) => safeString(candidate).trim()).filter(Boolean);
 }
 
+function isNullDeviceRedirectTarget(target: string): boolean {
+  const normalized = target.trim().replace(/^['"]|['"]$/g, "").toLowerCase();
+  return normalized === "/dev/null" || normalized === "nul";
+}
+
+function extractDeepInterviewCommandRedirectTargets(command: string): string[] {
+  const targets: string[] = [];
+  for (const match of command.matchAll(/(?:^|[^>])>{1,2}\s*(["']?)([^\s&|;<>]+)\1/g)) {
+    const candidate = safeString(match[2]).trim();
+    if (candidate && !isNullDeviceRedirectTarget(candidate)) targets.push(candidate);
+  }
+  return targets;
+}
+
 function commandHasDeepInterviewWriteIntent(command: string): boolean {
   return /\bapply_patch\b/.test(command)
-    || /(?:^|[;&|]\s*)(?:cat|printf|echo)\b[\s\S]{0,240}>\s*[^\s&|;]+/.test(command)
+    || extractDeepInterviewCommandRedirectTargets(command).length > 0
     || /\btee\s+(?:-a\s+)?[^\s&|;]+/.test(command)
     || /\bsed\s+(?:[^\n;&|]*\s)?-i(?:\b|['"])/.test(command)
     || /\b(?:python3?|node|perl|ruby)\b[\s\S]{0,260}\b(?:writeFileSync|writeFile|write_text|open\([^)]*["']w|File\.write|Path\()/.test(command)
@@ -2667,11 +2732,7 @@ function commandHasDeepInterviewWriteIntent(command: string): boolean {
 }
 
 function extractDeepInterviewCommandWriteTargets(command: string): string[] {
-  const targets: string[] = [];
-  for (const match of command.matchAll(/(?:^|[^>])>{1,2}\s*(["']?)([^\s&|;<>]+)\1/g)) {
-    const candidate = safeString(match[2]).trim();
-    if (candidate) targets.push(candidate);
-  }
+  const targets = extractDeepInterviewCommandRedirectTargets(command);
   for (const match of command.matchAll(/\btee\s+(?:-a\s+)?(["']?)([^\s&|;<>]+)\1/g)) {
     const candidate = safeString(match[2]).trim();
     if (candidate) targets.push(candidate);
@@ -3735,8 +3796,12 @@ async function buildStopHookOutput(
   const sessionId = readPayloadSessionId(payload);
   const canonicalSessionId = await resolveInternalSessionIdForPayload(cwd, sessionId);
   const threadId = readPayloadThreadId(payload);
+  const suppressParentWorkflowStop = shouldSuppressParentWorkflowStopForSideConversation(payload);
   if (canonicalSessionId) {
     await reconcileStaleRootSkillActiveStateForStop(cwd, stateDir, canonicalSessionId);
+  }
+  if (suppressParentWorkflowStop) {
+    return null;
   }
   const execFollowupOutput = await buildExecFollowupStopOutput(cwd, canonicalSessionId);
   if (execFollowupOutput) return execFollowupOutput;
@@ -4452,12 +4517,17 @@ function inferHookEventNameFromMalformedInput(raw: string): CodexHookEventName |
   return readHookEventName({ hook_event_name: value });
 }
 
-function buildMalformedStdinHookOutput(parseError: Error, rawInput: string): Record<string, unknown> {
+function buildMalformedStdinHookOutput(
+  parseError: Error,
+  rawInput: string,
+  cwd = process.cwd(),
+): Record<string, unknown> {
   const reason =
     "OMX native hook received malformed JSON input. Preserve runtime state, inspect the emitting hook payload yourself, and retry with valid JSON.";
   const systemMessage =
     `${reason} stdin JSON parsing failed inside codex-native-hook: ${parseError.message}.`;
-  if (inferHookEventNameFromMalformedInput(rawInput) === "Stop") {
+  const inferredHookEventName = inferHookEventNameFromMalformedInput(rawInput);
+  if (inferredHookEventName === "Stop" || (!inferredHookEventName && hasNativeStopRuntimeSurface(cwd))) {
     return {
       decision: "block",
       reason,
@@ -4603,7 +4673,7 @@ export async function runCodexNativeHookCli(): Promise<void> {
       {},
       buildRawInputLogFields(rawInput),
     );
-    writeNativeHookJsonStdout(buildMalformedStdinHookOutput(parseError, rawInput));
+    writeNativeHookJsonStdout(buildMalformedStdinHookOutput(parseError, rawInput, process.cwd()));
     return;
   }
 
