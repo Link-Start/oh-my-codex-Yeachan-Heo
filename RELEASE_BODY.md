@@ -10,7 +10,7 @@
 - Setup offers prompt-gated upgrades from legacy `gpt-5.3-codex` / `gpt-5.5` to `gpt-5.6-sol`.
 - Autopilot classifies canonical Terra/Luna as cheap planning lanes.
 - Doctor reports accurate Spark model sources including `models.team_low_complexity`.
-- New `omx capabilities lock`/`check` CLI with launch preflight (#3087).
+- New `omx capabilities lock`/`check` CLI providing a manual capabilities-lockfile preflight command (#3087).
 - Project setup defaults to plugin mode with plugin cache (#3085); plugin hooks gated to omx-launched sessions (#3086); resume plugin preflight opt-in (#3088).
 - Persisted subagents reopen on SessionStart (#3099); canonical worktree tool context (#3102).
 

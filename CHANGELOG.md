@@ -11,7 +11,7 @@ Minor release migrating the entire model contract to OpenAI's GPT-5.6 generation
 
 ### Added
 
-- **Capabilities lockfile preflight** — new `omx capabilities lock`/`check` CLI and launch preflight (#3087).
+- **Capabilities lockfile preflight** — new `omx capabilities lock`/`check` CLI providing a manual capabilities-lockfile preflight (#3087).
 - **GPT-5.6 model aliases** — `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6-sol` recognized as known Codex model aliases (#3104).
 - **Canonical worktree tool context** — shared CodeGraph/worktree tool-context resolution (#3102).
 - **Persisted subagents reopen on SessionStart** (#3099).
