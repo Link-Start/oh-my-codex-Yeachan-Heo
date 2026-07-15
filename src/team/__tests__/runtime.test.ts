@@ -7757,7 +7757,7 @@ case "$1" in
         printf '%%10\\tzsh\\tzsh\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-shutdown-kill-failure/worker-1 codex\\n'
         ;;
       *"-a -F #{pane_id}"*)
-        printf '%%13\\t0\\t999999\\n'
+        printf '%%10\t0\t2000000010\n%%13\t0\t999999\n'
         ;;
       *)
         exit 1
@@ -8606,12 +8606,7 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        if [ -f "${tmuxLogPath}.late-proof" ]; then
-          printf 'malformed snapshot\n'
-        else
-          : > "${tmuxLogPath}.late-proof"
-          printf '%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n'
-        fi
+        printf '%%11\t0\t2000000011\n%%12\t0\t2000000012\n%%13\t0\t2000000013\n'
         ;;
       *"-t leader:0 -F #{pane_id}"*) printf '%%11\\tzsh\\tzsh\\n%%12\\tnode\\tnode /omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-hud-prevalidation/worker-1 codex\\n' ;;
       *) exit 1 ;;
@@ -8649,6 +8644,133 @@ esac
         assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', teamName)), true);
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
         assert.doesNotMatch(tmuxLog, /set-hook -u|kill-pane|split-window|resize-pane|select-pane/);
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('shutdownTeam fails closed before killing a shared HUD whose pane PID changes after authorization', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-hud-pid-continuity-'));
+    const teamName = 'team-hud-pid-continuity';
+    try {
+      await withMockTmuxFixture({
+        dirPrefix: 'omx-runtime-shutdown-hud-pid-continuity-bin-',
+        tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  -V) echo 'tmux 3.4' ;;
+  list-panes)
+    case "$*" in
+      *"-a -F #{pane_id}"*)
+        count_file="${tmuxLogPath}.exact-reads"
+        count=0
+        [ -f "$count_file" ] && count=$(cat "$count_file")
+        count=$((count + 1))
+        printf '%s' "$count" > "$count_file"
+        hud_pid=2000000012
+        [ "$count" -ge 5 ] && hud_pid=2000000099
+        printf '%%11\\t0\\t2000000011\\n%%12\\t0\\t%s\\n%%13\\t0\\t2000000013\\n' "$hud_pid"
+        ;;
+      *"-t leader:0 -F #{pane_id}"*) printf '%%11\\tzsh\\tzsh\\n%%12\\tnode\\tnode /omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-hud-pid-continuity/worker-1 codex\\n' ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  show-option)
+    case "$*" in
+      *"-t %11 "*|*"-t %12 "*|*"-t %13 "*) echo 'team:team-hud-pid-continuity' ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  kill-pane|split-window|resize-pane|select-pane) exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+      }, async ({ tmuxLogPath }) => {
+        await initTeamState(teamName, 'shared HUD PID continuity test', 'executor', 1, cwd);
+        const config = await readTeamConfig(teamName, cwd);
+        assert.ok(config);
+        if (!config) return;
+        config.tmux_session = 'leader:0';
+        config.leader_pane_id = '%11';
+        config.hud_pane_id = '%12';
+        config.tmux_pane_owner_id = 'team:team-hud-pid-continuity';
+        config.workers[0]!.pane_id = '%13';
+        await saveTeamConfig(config, cwd);
+
+        await assert.rejects(() => shutdownTeam(teamName, cwd, { force: true }), /shutdown_shared_session_HUD_pane_identity_changed:%12/);
+        assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', teamName)), true);
+        const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+        assert.doesNotMatch(tmuxLog, /kill-pane -t %12|split-window/);
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('shutdownTeam fails closed before restoring onto a shared leader whose owner changes after authorization', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-leader-owner-continuity-'));
+    const teamName = 'team-leader-owner-continuity';
+    try {
+      await withMockTmuxFixture({
+        dirPrefix: 'omx-runtime-shutdown-leader-owner-continuity-bin-',
+        tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  -V) echo 'tmux 3.4' ;;
+  list-panes)
+    case "$*" in
+      *"-a -F #{pane_id}"*)
+        printf '%%11\t0\t2000000011\n'
+        if [ ! -f "${tmuxLogPath}.killed-%12" ]; then printf '%%12\t0\t2000000012\n'; fi
+        printf '%%13\t0\t2000000013\n'
+        ;;
+      *"-t leader:0 -F #{pane_id}"*) printf '%%11\\tzsh\\tzsh\\n%%12\\tnode\\tnode /omx.js hud --watch\\n%%13\\tcodex\\tenv OMX_TEAM_INTERNAL_WORKER=team-leader-owner-continuity/worker-1 codex\\n' ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  show-option)
+    case "$*" in
+      *"-t %11 "*)
+        count_file="${tmuxLogPath}.leader-owner-reads"
+        count=0
+        [ -f "$count_file" ] && count=$(cat "$count_file")
+        count=$((count + 1))
+        printf '%s' "$count" > "$count_file"
+        [ "$count" -ge 4 ] && { echo 'team:foreign'; exit 0; }
+        echo 'team:team-leader-owner-continuity'
+        ;;
+      *"-t %12 "*|*"-t %13 "*) echo 'team:team-leader-owner-continuity' ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  kill-pane)
+    : > "${tmuxLogPath}.killed-$3"
+    exit 0
+    ;;
+  split-window|resize-pane|select-pane) exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+      }, async ({ tmuxLogPath }) => {
+        await initTeamState(teamName, 'shared leader owner continuity test', 'executor', 1, cwd);
+        const config = await readTeamConfig(teamName, cwd);
+        assert.ok(config);
+        if (!config) return;
+        config.tmux_session = 'leader:0';
+        config.leader_pane_id = '%11';
+        config.hud_pane_id = '%12';
+        config.tmux_pane_owner_id = 'team:team-leader-owner-continuity';
+        config.workers[0]!.pane_id = '%13';
+        await saveTeamConfig(config, cwd);
+
+        await assert.rejects(() => shutdownTeam(teamName, cwd, { force: true }), /shutdown_shared_session_restore_leader_pane_owner_changed:%11/);
+        assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', teamName)), true);
+        const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+        assert.match(tmuxLog, /kill-pane -t %12/);
+        assert.doesNotMatch(tmuxLog, /split-window/);
       });
     } finally {
       await rm(cwd, { recursive: true, force: true });

@@ -4483,6 +4483,58 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     const canonicalWorkerPaneIds = [...shutdownPaneIds];
     const expectedSharedWorkerPanePids = new Map<string, number>();
     const prekillResolvedWorkerPaneIds = new Set<string>();
+    type FrozenSharedPaneAuthorization = {
+      paneId: string;
+      pid: number;
+      owner: string | null;
+    };
+    const freezeSharedPaneAuthorization = (
+      paneId: string,
+      kind: 'HUD pane' | 'restore leader pane',
+      allowLegacyMissingOwner: boolean,
+    ): FrozenSharedPaneAuthorization => {
+      const proof = readExactPaneProofSync(paneId);
+      if (proof.status !== 'live') {
+        throw new Error(`shutdown_shared_session_${kind.replaceAll(' ', '_')}_proof_unavailable:${paneId}`);
+      }
+      const owner = readPaneTeamOwnerTagResult(paneId);
+      if (owner.status === 'error') {
+        throw new Error(`shutdown_shared_session_${kind.replaceAll(' ', '_')}_owner_unavailable:${paneId}:${owner.error}`);
+      }
+      if (owner.status === 'value') {
+        if (!tmuxPaneOwnerId || owner.value !== tmuxPaneOwnerId) {
+          throw new Error(`shutdown_shared_session_${kind.replaceAll(' ', '_')}_owner_changed:${paneId}`);
+        }
+        return { paneId, pid: proof.pid, owner: owner.value };
+      }
+      if (!allowLegacyMissingOwner) {
+        throw new Error(`shutdown_shared_session_${kind.replaceAll(' ', '_')}_owner_changed:${paneId}`);
+      }
+      return { paneId, pid: proof.pid, owner: null };
+    };
+    const assertSharedPaneAuthorizationContinuous = (
+      authorization: FrozenSharedPaneAuthorization,
+      kind: 'HUD pane' | 'restore leader pane',
+    ): void => {
+      const proof = readExactPaneProofSync(authorization.paneId);
+      if (proof.status !== 'live' || proof.pid !== authorization.pid) {
+        throw new Error(`shutdown_shared_session_${kind.replaceAll(' ', '_')}_identity_changed:${authorization.paneId}`);
+      }
+      const owner = readPaneTeamOwnerTagResult(authorization.paneId);
+      if (owner.status === 'error') {
+        throw new Error(`shutdown_shared_session_${kind.replaceAll(' ', '_')}_owner_unavailable:${authorization.paneId}:${owner.error}`);
+      }
+      const currentOwner = owner.status === 'value' ? owner.value : null;
+      if (currentOwner !== authorization.owner) {
+        throw new Error(`shutdown_shared_session_${kind.replaceAll(' ', '_')}_owner_changed:${authorization.paneId}`);
+      }
+    };
+    const frozenHudAuthorization = sharedSessionTopology && effectiveHudPaneId
+      ? freezeSharedPaneAuthorization(effectiveHudPaneId, 'HUD pane', true)
+      : null;
+    const frozenRestoreLeaderAuthorization = sharedSessionTopology && trustedHudRestoreLeaderPaneId
+      ? freezeSharedPaneAuthorization(trustedHudRestoreLeaderPaneId, 'restore leader pane', true)
+      : null;
 
     const assertCompleteSharedWorkerPaneProofs = (allowResolvedGone = false): void => {
 
@@ -4559,25 +4611,21 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
 
     }
 
-    let resizeHookWarning: string | null = null;
-    if (config.resize_hook_name && config.resize_hook_target) {
-      const resizeHookName = config.resize_hook_name;
-      const unregistered = unregisterResizeHook(config.resize_hook_target, resizeHookName);
-      if (!unregistered && isTmuxAvailable()) {
-        const baseSession = sessionName.split(':')[0];
-        const sessionStillActive = listTeamSessions().includes(baseSession);
-        if (sessionStillActive) {
-          resizeHookWarning = `failed to unregister resize hook ${resizeHookName}`;
-        }
-      }
-    }
-    if (resizeHookWarning) {
-      console.warn(`[team shutdown] ${sanitized}: ${resizeHookWarning}; continuing teardown`);
-    }
     let restoredHudPaneId: string | null = null;
     if (effectiveHudPaneId) {
+      // Confirm restoration authority before removing the shared HUD, then
+      // check it again immediately before the split below.
+      if (sessionName.includes(':') && frozenRestoreLeaderAuthorization) {
+        assertSharedPaneAuthorizationContinuous(frozenRestoreLeaderAuthorization, 'restore leader pane');
+      }
+      if (frozenHudAuthorization) {
+        assertSharedPaneAuthorizationContinuous(frozenHudAuthorization, 'HUD pane');
+      }
       const hudTeardown = await teardownWorkerPanes([effectiveHudPaneId], {
         leaderPaneId: effectiveLeaderPaneId,
+        expectedPanePids: frozenHudAuthorization
+          ? { [frozenHudAuthorization.paneId]: frozenHudAuthorization.pid }
+          : undefined,
       });
       assertPaneTeardownProofsAvailable('shutdown', hudTeardown.proofUnavailable);
       if (hudTeardown.kill.failed > 0) {
@@ -4585,6 +4633,9 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       }
 
       if (sessionName.includes(':')) {
+        if (frozenRestoreLeaderAuthorization) {
+          assertSharedPaneAuthorizationContinuous(frozenRestoreLeaderAuthorization, 'restore leader pane');
+        }
         restoredHudPaneId = restoreStandaloneHudPane(trustedHudRestoreLeaderPaneId, cwd, {
           sessionId: leaderSessionId,
         });
@@ -4599,6 +4650,22 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         config.hud_pane_id = restoredHudPaneId;
         await saveTeamConfig(config, cwd);
       }
+    }
+
+    let resizeHookWarning: string | null = null;
+    if (config.resize_hook_name && config.resize_hook_target) {
+      const resizeHookName = config.resize_hook_name;
+      const unregistered = unregisterResizeHook(config.resize_hook_target, resizeHookName);
+      if (!unregistered && isTmuxAvailable()) {
+        const baseSession = sessionName.split(':')[0];
+        const sessionStillActive = listTeamSessions().includes(baseSession);
+        if (sessionStillActive) {
+          resizeHookWarning = `failed to unregister resize hook ${resizeHookName}`;
+        }
+      }
+    }
+    if (resizeHookWarning) {
+      console.warn(`[team shutdown] ${sanitized}: ${resizeHookWarning}; continuing teardown`);
     }
     const workerTeardown = await teardownWorkerPanes(
       shutdownPaneIds.filter((paneId) => !prekillResolvedWorkerPaneIds.has(paneId)),
