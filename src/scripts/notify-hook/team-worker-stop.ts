@@ -297,12 +297,13 @@ export async function maybeNudgeLeaderForAllowedWorkerStop({
   const leaderPanePid = Number.isInteger(teamInfo.leaderPanePid) && Number(teamInfo.leaderPanePid) > 0
     ? Number(teamInfo.leaderPanePid)
     : undefined;
+  const leaderPaneOwnerId = safeString(teamInfo.tmuxPaneOwnerId).trim();
   const resolvedLeaderPaneId = await resolveCanonicalLeaderPaneId(leaderPaneId);
   const tmuxTarget = resolvedLeaderPaneId && resolvedLeaderPaneId !== normalizeExactPaneId(teamInfo.hudPaneId)
     ? resolvedLeaderPaneId
     : '';
 
-  if (!tmuxTarget || !leaderPanePid) {
+  if (!tmuxTarget || !leaderPanePid || !leaderPaneOwnerId) {
     if (!(await teamStateAllowsWorkerStopNudge(stateDir, teamName))) {
       await recordShutdownSuppressionOnce();
       return { ok: true, result: TEAM_SHUTDOWN_NO_INJECTION_REASON };
@@ -328,6 +329,7 @@ export async function maybeNudgeLeaderForAllowedWorkerStop({
     requireIdle: false,
     exactPaneId: tmuxTarget,
     expectedPanePid: leaderPanePid,
+    expectedPaneOwnerId: leaderPaneOwnerId,
   });
   if (!paneGuard.ok) {
     if (!(await teamStateAllowsWorkerStopNudge(stateDir, teamName))) {
@@ -367,6 +369,8 @@ export async function maybeNudgeLeaderForAllowedWorkerStop({
       submitDelayMs: 100,
       exactPaneId: tmuxTarget,
       expectedPanePid: leaderPanePid,
+      expectedPaneOwnerId: leaderPaneOwnerId,
+      expectedHudPaneId: teamInfo.hudPaneId,
     });
     if (!sendResult.ok) throw new Error(sendResult.error || sendResult.reason || 'send_failed');
     const deliveryMode = leaderHasActiveTask ? 'steered' : 'sent';

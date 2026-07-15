@@ -222,8 +222,9 @@ export async function readTeamWorkersForIdleCheck(stateDir, teamName) {
       const leaderPaneId = safeString(parsed.leader_pane_id || '').trim();
       const hudPaneId = safeString(parsed.hud_pane_id || '').trim();
       const leaderPanePid = positivePanePid(parsed.leader_pane_pid);
-      const result = { workers, tmuxSession, leaderPaneId, leaderPanePid, hudPaneId };
-      if (leaderPaneId && leaderPanePid) return result;
+      const tmuxPaneOwnerId = safeString(parsed.tmux_pane_owner_id || '').trim();
+      const result = { workers, tmuxSession, leaderPaneId, leaderPanePid, tmuxPaneOwnerId, hudPaneId };
+      if (leaderPaneId && leaderPanePid && tmuxPaneOwnerId) return result;
       if (!fallback) fallback = result;
     } catch {
       // Try the next state source.
@@ -263,7 +264,7 @@ function resolveCanonicalLeaderPaneId(_tmuxSession, leaderPaneId) {
   return normalizeExactPaneId(leaderPaneId);
 }
 
-async function checkLeaderPaneReadyForWorkerStateReminder(paneTarget, exactPaneId, expectedPanePid) {
+async function checkLeaderPaneReadyForWorkerStateReminder(paneTarget, exactPaneId, expectedPanePid, expectedPaneOwnerId) {
   return evaluatePaneInjectionReadiness(paneTarget, {
     skipIfScrolling: true,
     // Worker-state reminders are their own trigger path. They should still
@@ -274,6 +275,7 @@ async function checkLeaderPaneReadyForWorkerStateReminder(paneTarget, exactPaneI
     requireIdle: false,
     exactPaneId,
     expectedPanePid,
+    expectedPaneOwnerId,
   });
 }
 
@@ -364,7 +366,7 @@ export async function maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, 
   // Read team config to get worker list and leader tmux target
   const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName);
   if (!teamInfo) return;
-  const { workers, tmuxSession, leaderPaneId, leaderPanePid, hudPaneId } = teamInfo;
+  const { workers, tmuxSession, leaderPaneId, leaderPanePid, tmuxPaneOwnerId, hudPaneId } = teamInfo;
   const resolvedLeaderPaneId = await resolveCanonicalLeaderPaneId(tmuxSession, leaderPaneId);
   const canonicalLeaderPaneId = resolvedLeaderPaneId && resolvedLeaderPaneId !== normalizeExactPaneId(hudPaneId)
     ? resolvedLeaderPaneId
@@ -399,7 +401,7 @@ export async function maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, 
   });
   const orchestrationIntent = resolveAllWorkersIdleIntent(leaderActionState);
 
-  if (!canonicalLeaderPaneId || !positivePanePid(leaderPanePid)) {
+  if (!canonicalLeaderPaneId || !positivePanePid(leaderPanePid) || !tmuxPaneOwnerId) {
     const nextIdleState = {
       ...idleState,
       last_notified_at_ms: nowMs,
@@ -426,7 +428,7 @@ export async function maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, 
   const nextAction = `Run \`omx team status ${teamName}\` now, read unread worker messages, then assign the next concrete task, reconcile results, or shut the team down.`;
   const message = `[OMX] All ${N} worker${N === 1 ? '' : 's'} idle. ${nextAction} ${DEFAULT_MARKER}`;
   const tmuxTarget = canonicalLeaderPaneId;
-  const paneGuard = await checkLeaderPaneReadyForWorkerStateReminder(tmuxTarget, canonicalLeaderPaneId, leaderPanePid);
+  const paneGuard = await checkLeaderPaneReadyForWorkerStateReminder(tmuxTarget, canonicalLeaderPaneId, leaderPanePid, tmuxPaneOwnerId);
   if (!paneGuard.ok) {
     const nextIdleState = {
       ...idleState,
@@ -461,6 +463,8 @@ export async function maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, 
       submitDelayMs: 100,
       exactPaneId: canonicalLeaderPaneId,
       expectedPanePid: leaderPanePid,
+      expectedPaneOwnerId: tmuxPaneOwnerId,
+      expectedHudPaneId: hudPaneId,
     });
     if (!sendResult.ok) throw new Error(sendResult.error || sendResult.reason || 'send_failed');
 
@@ -593,13 +597,13 @@ export async function maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, pars
   // Read team config for tmux target
   const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName);
   if (!teamInfo) return;
-  const { tmuxSession, leaderPaneId, leaderPanePid, hudPaneId } = teamInfo;
+  const { tmuxSession, leaderPaneId, leaderPanePid, tmuxPaneOwnerId, hudPaneId } = teamInfo;
   const resolvedLeaderPaneId = await resolveCanonicalLeaderPaneId(tmuxSession, leaderPaneId);
   const canonicalLeaderPaneId = resolvedLeaderPaneId && resolvedLeaderPaneId !== normalizeExactPaneId(hudPaneId)
     ? resolvedLeaderPaneId
     : '';
 
-  if (!canonicalLeaderPaneId || !positivePanePid(leaderPanePid)) {
+  if (!canonicalLeaderPaneId || !positivePanePid(leaderPanePid) || !tmuxPaneOwnerId) {
     await emitLeaderPaneMissingDeferred({
       stateDir,
       logsDir,
@@ -613,7 +617,7 @@ export async function maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, pars
     return;
   }
   const tmuxTarget = canonicalLeaderPaneId;
-  const paneGuard = await checkLeaderPaneReadyForWorkerStateReminder(tmuxTarget, canonicalLeaderPaneId, leaderPanePid);
+  const paneGuard = await checkLeaderPaneReadyForWorkerStateReminder(tmuxTarget, canonicalLeaderPaneId, leaderPanePid, tmuxPaneOwnerId);
   if (!paneGuard.ok) {
     try {
       const tmpPath = cooldownPath + '.tmp.' + process.pid;
@@ -658,6 +662,8 @@ export async function maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, pars
       submitDelayMs: 100,
       exactPaneId: canonicalLeaderPaneId,
       expectedPanePid: leaderPanePid,
+      expectedPaneOwnerId: tmuxPaneOwnerId,
+      expectedHudPaneId: hudPaneId,
     });
     if (!sendResult.ok) throw new Error(sendResult.error || sendResult.reason || 'send_failed');
 

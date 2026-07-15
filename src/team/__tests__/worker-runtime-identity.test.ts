@@ -218,7 +218,7 @@ process.on('SIGTERM', () => process.exit(0));
           '    ;;',
           '  show-option)',
           '    case "$*" in',
-          '      *"-p -t %21 @omx_team_pane_owner_id"*)',
+          '      *"-p -t %21 @omx_team_pane_owner_id"*|*"-p -t %31 @omx_team_pane_owner_id"*)',
           '        echo "team:low-role-scale"',
           '        ;;',
           '      *)',
@@ -261,6 +261,7 @@ process.on('SIGTERM', () => process.exit(0));
       config.tmux_session = 'omx-team-low-role-scale';
       config.leader_pane_id = '%11';
       config.leader_pane_pid = 42421;
+      config.tmux_pane_owner_id = 'team:low-role-scale';
       config.workers[0]!.pane_id = '%21';
       config.workers[0]!.pid = 42422;
       await saveTeamConfig(config, cwd);
@@ -336,7 +337,7 @@ process.on('SIGTERM', () => process.exit(0));
           '    ;;',
           '  show-option)',
           '    case "$*" in',
-          '      *"-p -t %21 @omx_team_pane_owner_id"*)',
+          '      *"-p -t %21 @omx_team_pane_owner_id"*|*"-p -t %31 @omx_team_pane_owner_id"*)',
           '        echo "team:exact-role-cli"',
           '        ;;',
           '      *)',
@@ -376,6 +377,7 @@ process.on('SIGTERM', () => process.exit(0));
       config.tmux_session = 'omx-team-exact-role-cli';
       config.leader_pane_id = '%11';
       config.leader_pane_pid = 42421;
+      config.tmux_pane_owner_id = 'team:exact-role-cli';
       config.workers[0]!.pane_id = '%21';
       config.workers[0]!.pid = 42422;
       config.next_worker_index = 3;

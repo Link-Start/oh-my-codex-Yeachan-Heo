@@ -3516,6 +3516,20 @@ exit 0
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
       await initTeamState('dispatch-team', 'task', 'executor', 1, wd);
+      for (const filename of ['config.json', 'manifest.v2.json']) {
+        const path = join(wd, '.omx', 'state', 'team', 'dispatch-team', filename);
+        const teamState = JSON.parse(await readFile(path, 'utf8')) as {
+          workers?: Array<Record<string, unknown>>;
+          [key: string]: unknown;
+        };
+        teamState.tmux_pane_owner_id = 'team:dispatch-team';
+        teamState.leader_pane_id = '%42';
+        teamState.leader_pane_pid = 4242;
+        teamState.workers = (teamState.workers ?? []).map((worker, index) => (
+          index === 0 ? { ...worker, pane_id: '%42', pid: 4242 } : worker
+        ));
+        await writeFile(path, JSON.stringify(teamState, null, 2));
+      }
       const queued = await enqueueDispatchRequest('dispatch-team', {
         kind: 'inbox',
         to_worker: 'worker-1',

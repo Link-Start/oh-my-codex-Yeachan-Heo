@@ -242,12 +242,20 @@ function killExactPaneSync(paneId: string, expectedPid?: number, assertAuthoriza
     throw new Error(`tmux pane identity changed: ${paneId}`);
   }
   assertAuthorization?.();
-  const result = runTmux(['kill-pane', '-t', proof.paneId]);
-  if (!result.ok) throw new Error(`failed to kill tmux pane ${proof.paneId}: ${result.stderr}`);
-  const afterKill = readExactPaneProofSync(proof.paneId);
+  // Authorization can read tmux. Re-prove immediately after it so a recycled
+  // pane ID cannot be targeted by the subsequent kill.
+  const finalProof = readExactPaneProofSync(proof.paneId);
+  if (finalProof.status === 'unavailable') throw new ExactPaneProofUnavailableError(finalProof);
+  if (finalProof.status === 'gone') return;
+  if (finalProof.pid !== proof.pid || (expectedPid !== undefined && finalProof.pid !== expectedPid)) {
+    throw new Error(`tmux pane identity changed: ${paneId}`);
+  }
+  const result = runTmux(['kill-pane', '-t', finalProof.paneId]);
+  if (!result.ok) throw new Error(`failed to kill tmux pane ${finalProof.paneId}: ${result.stderr}`);
+  const afterKill = readExactPaneProofSync(finalProof.paneId);
   if (afterKill.status === 'unavailable') throw new ExactPaneProofUnavailableError(afterKill);
   if (afterKill.status !== 'gone') {
-    if (afterKill.pid !== proof.pid) throw new Error(`tmux pane identity changed: ${paneId}`);
+    if (afterKill.pid !== finalProof.pid) throw new Error(`tmux pane identity changed: ${paneId}`);
     throw new Error(`tmux pane remains live after kill: ${paneId}`);
   }
 }
@@ -638,23 +646,36 @@ function createPinnedWorkerPaneTargetResolverSync(
   workerIndex: number,
   workerPaneId?: string,
   expectedPanePid?: number,
+  expectedTeamOwnerId?: string,
+  hudPaneId?: string,
 ): () => string | null {
   if (!hasExplicitWorkerPaneId(workerPaneId)) {
     return () => resolveWorkerPaneTargetSync(sessionName, workerIndex, workerPaneId);
   }
 
   const pinnedPid = expectedPanePid;
+  const expectedOwner = typeof expectedTeamOwnerId === 'string' ? expectedTeamOwnerId.trim() : '';
+  const canonicalHudPaneId = typeof hudPaneId === 'string' ? hudPaneId.trim() : '';
   return () => {
     if (typeof pinnedPid !== 'number' || !Number.isSafeInteger(pinnedPid) || pinnedPid <= 0) return null;
-
+    if (!expectedOwner) return null;
+    if (canonicalHudPaneId && workerPaneId === canonicalHudPaneId) {
+      throw new Error(`tmux worker pane is HUD target: ${workerPaneId}`);
+    }
     const proof = readExactPaneProofSync(workerPaneId);
     if (proof.status !== 'live') return null;
     if (proof.pid !== pinnedPid) {
       throw new Error(`tmux pane identity changed: ${workerPaneId}`);
     }
-    return proof.paneId;
+    const owner = readPaneTeamOwnerTagResult(proof.paneId);
+    if (owner.status !== 'value' || owner.value !== expectedOwner) return null;
+    const finalProof = readExactPaneProofSync(workerPaneId);
+    if (finalProof.status !== 'live') return null;
+    if (finalProof.pid !== pinnedPid) {
+      throw new Error(`tmux pane identity changed: ${workerPaneId}`);
+    }
+    return finalProof.paneId;
   };
-
 }
 
 function createPinnedWorkerPaneTargetResolver(
@@ -662,26 +683,45 @@ function createPinnedWorkerPaneTargetResolver(
   workerIndex: number,
   workerPaneId?: string,
   expectedPanePid?: number,
+  expectedTeamOwnerId?: string,
+  hudPaneId?: string,
 ): AsyncPaneTargetResolver {
   if (!hasExplicitWorkerPaneId(workerPaneId)) {
     return () => resolveWorkerPaneTargetAsync(sessionName, workerIndex, workerPaneId);
   }
 
   const pinnedPid = expectedPanePid;
+  const expectedOwner = typeof expectedTeamOwnerId === 'string' ? expectedTeamOwnerId.trim() : '';
+  const canonicalHudPaneId = typeof hudPaneId === 'string' ? hudPaneId.trim() : '';
   let lastResolvedPid: number | undefined;
   const resolveTarget: AsyncPaneTargetResolver = async () => {
     if (typeof pinnedPid !== 'number' || !Number.isSafeInteger(pinnedPid) || pinnedPid <= 0) return null;
+    if (!expectedOwner) return null;
+    if (canonicalHudPaneId && workerPaneId === canonicalHudPaneId) {
+      throw new Error(`tmux worker pane is HUD target: ${workerPaneId}`);
+    }
     const proof = await readExactPaneProof(workerPaneId);
     if (proof.status !== 'live') return null;
     if (proof.pid !== pinnedPid) {
       throw new Error(`tmux pane identity changed: ${workerPaneId}`);
     }
-    lastResolvedPid = proof.pid;
-    return proof.paneId;
+    const owner = readPaneTeamOwnerTagResult(proof.paneId);
+    if (owner.status !== 'value' || owner.value !== expectedOwner) {
+      const detail = owner.status === 'error' ? owner.error : 'missing';
+      throw new Error(`tmux pane team owner changed: ${workerPaneId}: ${detail}`);
+    }
+    // The option read is untrusted and can race pane ID reuse. Its immediately
+    // adjacent PID proof authorizes the following capture/control/input effect.
+    const finalProof = await readExactPaneProof(workerPaneId);
+    if (finalProof.status !== 'live') return null;
+    if (finalProof.pid !== pinnedPid) {
+      throw new Error(`tmux pane identity changed: ${workerPaneId}`);
+    }
+    lastResolvedPid = finalProof.pid;
+    return finalProof.paneId;
   };
   resolveTarget.lastResolvedPid = () => lastResolvedPid;
   return resolveTarget;
-
 }
 
 type AsyncPaneTargetResolver = (() => Promise<string | null>) & {
@@ -1852,6 +1892,9 @@ export function createTeamSession(
   let registeredResizeHook: { name: string; target: string } | null = null;
   let registeredClientAttachedHook: { name: string; target: string } | null = null;
   const rollbackPanes = new Map<string, number>();
+  // An owner-tag command may have succeeded even if tmux reports an ambiguous
+  // failure; rollback can only kill panes whose owner is re-authorized.
+  const rollbackTaggedPaneOwnerIds = new Map<string, string>();
   let partialTeamTarget: string | null = null;
   let partialLeaderPaneId: string | null = null;
   let partialLeaderPanePid: number | undefined;
@@ -1997,6 +2040,7 @@ export function createTeamSession(
         throw new Error(`worker pane ${i} did not remain present after tmux split-window returned ${paneId}`);
       }
       tagPaneInstance(paneId, ownerSessionId, panePid);
+      rollbackTaggedPaneOwnerIds.set(paneId, teamPaneOwnerId);
       tagPaneTeamOwner(paneId, teamPaneOwnerId, panePid);
       frozenWindowPaneOwners.set(paneId, teamPaneOwnerId);
       workerPaneIds.push(paneId);
@@ -2055,6 +2099,7 @@ export function createTeamSession(
             throw new Error(`HUD pane did not remain present after tmux split-window returned ${id}`);
           }
           tagPaneInstance(id, ownerSessionId, hudPanePid);
+          rollbackTaggedPaneOwnerIds.set(id, teamPaneOwnerId);
           tagPaneTeamOwner(id, teamPaneOwnerId, hudPanePid);
           frozenWindowPaneOwners.set(id, teamPaneOwnerId);
           hudPaneId = id;
@@ -2173,10 +2218,11 @@ export function createTeamSession(
     const unresolvedPaneIds = new Set(rollbackPanes.keys());
     for (const [paneId, panePid] of rollbackPanes) {
       try {
-        killExactPaneSync(paneId, panePid);
-
+        const expectedOwnerId = rollbackTaggedPaneOwnerIds.get(paneId);
+        killExactPaneSync(paneId, panePid, expectedOwnerId
+          ? () => { requireLiveTeamOwnedPaneSync(paneId, panePid, expectedOwnerId); }
+          : undefined);
         unresolvedPaneIds.delete(paneId);
-
       } catch (cleanupError) {
         if (cleanupError instanceof ExactPaneProofUnavailableError) {
           proofUnavailable.push(cleanupError.proof);
@@ -2669,13 +2715,15 @@ export function waitForWorkerReady(
   timeoutMs: number = 30_000,
   workerPaneId?: string,
   expectedPanePid?: number,
+  expectedTeamOwnerId?: string,
+  hudPaneId?: string,
 ): boolean {
   const initialBackoffMs = 150;
   const maxBackoffMs = 8000;
   const startedAt = Date.now();
   let blockedByTrustPrompt = false;
   let promptDismissed = false;
-  const resolveTarget = createPinnedWorkerPaneTargetResolverSync(sessionName, workerIndex, workerPaneId, expectedPanePid);
+  const resolveTarget = createPinnedWorkerPaneTargetResolverSync(sessionName, workerIndex, workerPaneId, expectedPanePid, expectedTeamOwnerId, hudPaneId);
 
   const sendRobustEnter = (): void => {
     // Trust + follow-up splash can require two submits in Codex TUI.
@@ -2753,13 +2801,15 @@ export async function waitForWorkerReadyAsync(
   timeoutMs: number = 30_000,
   workerPaneId?: string,
   expectedPanePid?: number,
+  expectedTeamOwnerId?: string,
+  hudPaneId?: string,
 ): Promise<boolean> {
   const initialBackoffMs = 150;
   const maxBackoffMs = 8000;
   const startedAt = Date.now();
   let blockedByTrustPrompt = false;
   let promptDismissed = false;
-  const resolveTarget = createPinnedWorkerPaneTargetResolver(sessionName, workerIndex, workerPaneId, expectedPanePid);
+  const resolveTarget = createPinnedWorkerPaneTargetResolver(sessionName, workerIndex, workerPaneId, expectedPanePid, expectedTeamOwnerId, hudPaneId);
 
 
   const sendRobustEnter = async (): Promise<void> => {
@@ -2839,10 +2889,12 @@ export function dismissTrustPromptIfPresent(
   workerIndex: number,
   workerPaneId?: string,
   expectedPanePid?: number,
+  expectedTeamOwnerId?: string,
+  hudPaneId?: string,
 ): boolean {
   if (process.env.OMX_TEAM_AUTO_TRUST === '0') return false;
   if (!isTmuxAvailable()) return false;
-  const resolveTarget = createPinnedWorkerPaneTargetResolverSync(sessionName, workerIndex, workerPaneId, expectedPanePid);
+  const resolveTarget = createPinnedWorkerPaneTargetResolverSync(sessionName, workerIndex, workerPaneId, expectedPanePid, expectedTeamOwnerId, hudPaneId);
   const captureTarget = resolveTarget();
   if (!captureTarget) return false;
   const result = runTmux(sharedBuildVisibleCapturePaneArgv(captureTarget));
@@ -2901,11 +2953,19 @@ export async function sendToWorker(
   workerPaneId?: string,
   workerCli?: TeamWorkerCli,
   expectedPanePid?: number,
-
+  expectedTeamOwnerId?: string,
+  hudPaneId?: string,
 ): Promise<void> {
   assertWorkerTriggerText(text);
 
-  const resolveTarget = createPinnedWorkerPaneTargetResolver(sessionName, workerIndex, workerPaneId, expectedPanePid);
+  const resolveTarget = createPinnedWorkerPaneTargetResolver(
+    sessionName,
+    workerIndex,
+    workerPaneId,
+    expectedPanePid,
+    expectedTeamOwnerId,
+    hudPaneId,
+  );
 
 
   const strategy = resolveSendStrategyFromEnv();
@@ -3100,11 +3160,13 @@ export async function killWorker(
   workerPaneId?: string,
   leaderPaneId?: string,
   expectedPanePid?: number,
+  expectedTeamOwnerId?: string,
+  hudPaneId?: string,
 ): Promise<void> {
   // Guard: never kill the leader's own pane.
   if (leaderPaneId && workerPaneId === leaderPaneId) return;
 
-  const resolveTarget = createPinnedWorkerPaneTargetResolver(sessionName, workerIndex, workerPaneId, expectedPanePid);
+  const resolveTarget = createPinnedWorkerPaneTargetResolver(sessionName, workerIndex, workerPaneId, expectedPanePid, expectedTeamOwnerId, hudPaneId);
   const initialTarget = await resolveTarget();
   if (!initialTarget) return;
   await runTmuxAsync(['send-keys', '-t', initialTarget, 'C-c']);
@@ -3547,8 +3609,29 @@ export async function teardownWorkerPanes(
       break;
     }
 
+    // Owner authorization can read tmux. Re-prove the persisted identity after
+    // it and immediately before kill-pane.
+    const finalProof = await readExactPaneProof(proof.paneId);
+    if (finalProof.status === 'gone') {
+      summary.provenGonePaneIds.push(finalProof.paneId);
+      continue;
+    }
+    if (finalProof.status === 'unavailable') {
+      summary.proofUnavailable.push(finalProof);
+      break;
+    }
+    if (typeof expectedPid === 'number' && finalProof.pid !== expectedPid) {
+      summary.proofUnavailable.push({
+        status: 'unavailable',
+        paneId: finalProof.paneId,
+        reason: 'pane_pid_changed',
+        detail: `expected ${expectedPid}, got ${finalProof.pid}`,
+      });
+      break;
+    }
+
     summary.kill.attempted += 1;
-    const result = await runTmuxAsync(['kill-pane', '-t', proof.paneId]);
+    const result = await runTmuxAsync(['kill-pane', '-t', finalProof.paneId]);
     if (!result.ok) {
       summary.kill.failed += 1;
       summary.kill.failedPaneIds.push(proof.paneId);
@@ -3556,7 +3639,7 @@ export async function teardownWorkerPanes(
       break;
     }
 
-    const afterKill = await readExactPaneProof(proof.paneId);
+    const afterKill = await readExactPaneProof(finalProof.paneId);
     if (afterKill.status === 'gone') {
       summary.kill.succeeded += 1;
       summary.killedPaneIds.push(proof.paneId);

@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -28,6 +28,10 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" && "\${@: -1}" == "@omx_team_pane_owner_id" ]]; then
+  printf '%s\n' 'team:test'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   exit 0
 fi
@@ -75,6 +79,18 @@ function writeWorkerIdentityFixture(cwd: string, workerEnv: string): string {
   assert.ok(workerName, 'worker env fixture should include a worker name');
 
   const stateRoot = join(cwd, '.omx', 'state');
+  const configPath = join(stateRoot, 'team', teamName, 'config.json');
+  if (existsSync(configPath)) {
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+    if (typeof config.leader_pane_id === 'string' && config.leader_pane_id.trim() !== '') {
+      config.tmux_pane_owner_id = 'team:test';
+      if (!(typeof config.leader_pane_pid === 'number' && config.leader_pane_pid > 0)) {
+        const paneNumber = Number(config.leader_pane_id.slice(1));
+        if (Number.isInteger(paneNumber) && paneNumber > 0) config.leader_pane_pid = 12000 + paneNumber;
+      }
+      writeFileSync(configPath, JSON.stringify(config, null, 2));
+    }
+  }
   const workerDir = join(stateRoot, 'team', teamName, 'workers', workerName);
   const identityPath = join(workerDir, 'identity.json');
   if (!existsSync(identityPath)) {
@@ -297,6 +313,10 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" && "\${@: -1}" == "@omx_team_pane_owner_id" ]]; then
+  printf '%s\n' 'team:test'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -411,6 +431,10 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" && "\${@: -1}" == "@omx_team_pane_owner_id" ]]; then
+  printf '%s\n' 'team:test'
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -959,6 +983,7 @@ exit 0
         tmux_session: 'correct-session:1',
         leader_pane_id: '%123',
         leader_pane_pid: 12123,
+        tmux_pane_owner_id: 'team:test',
         worker_count: 1,
         workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] }],
         next_task_id: 1,

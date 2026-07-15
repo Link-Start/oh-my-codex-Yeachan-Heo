@@ -83,6 +83,11 @@ if [[ "$cmd" == "display-message" ]]; then
   fi
   exit 0
 fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_team_pane_owner_id" ]]; then
+  echo "team:alpha"
+  exit 0
+fi
+
 if [[ "$cmd" == "set-buffer" ]]; then
   printf '%s' "\${@: -1}" > "${tmuxLogPath}.buffer"
   exit 0
@@ -139,18 +144,20 @@ exit 0
 function assertFreshExactProofBeforePaneEffects(tmuxLog: string, paneId: string): void {
   const commands = tmuxLog.trim().split('\n').filter(Boolean);
   const exactGlobalPaneProof = /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/;
+  const ownerProof = new RegExp(`^show-option -qv -p -t ${paneId} @omx_team_pane_owner_id$`);
   const effects = commands
     .map((command, index) => ({ command, index }))
     .filter(({ command }) => (
-      command.startsWith('set-buffer -b omx-pane-input-')
-      || command.startsWith(`paste-buffer -t ${paneId} `)
+      command.startsWith(`paste-buffer -t ${paneId} `)
       || command.startsWith(`kill-pane -t ${paneId} `)
       || (command.startsWith(`send-keys -t ${paneId} `) && !command.includes(' -l '))
     ));
 
   assert.ok(effects.length > 0, `expected explicit pane effects for ${paneId}:\n${commands.join('\n')}`);
   for (const { command, index } of effects) {
-    assert.match(commands[index - 1] ?? '', exactGlobalPaneProof, `fresh proof must immediately precede ${command}`);
+    assert.match(commands[index - 1] ?? '', exactGlobalPaneProof, `final PID proof must immediately precede ${command}`);
+    assert.match(commands[index - 2] ?? '', ownerProof, `owner proof must immediately precede the final PID proof for ${command}`);
+    assert.match(commands[index - 3] ?? '', exactGlobalPaneProof, `initial PID proof must precede owner proof for ${command}`);
   }
 }
 
@@ -955,6 +962,10 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "codex"
     exit 0
   fi
+  exit 0
+fi
+if [[ "$cmd" == "show-option" && "$*" == *"@omx_team_pane_owner_id" ]]; then
+  echo "team:alpha"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -1867,7 +1878,7 @@ exit 0
   });
 
 
-  it('resolves session-only dispatch targets without managed leader session context', async () => {
+  it('rejects a session-only dispatch target without an exact Team pane binding', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-dispatch-session-target-'));
     const stateDir = join(cwd, '.omx', 'state');
     const logsDir = join(cwd, '.omx', 'logs');
@@ -1908,12 +1919,9 @@ exit 0
 
       const requests = JSON.parse(await readFile(join(stateDir, 'team', 'session-target-team', 'dispatch', 'requests.json'), 'utf-8'));
       const request = requests.find((entry: { to_worker?: string }) => entry.to_worker === 'worker-1');
-      assert.notEqual(request?.status, 'failed');
-      assert.doesNotMatch(JSON.stringify(request), /target_resolution_failed/);
-      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /list-panes -t omx-team-session-target/);
-      assert.match(tmuxLog, /send-keys -t %42 -l dispatch ping/);
-      assert.match(tmuxLog, /list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}/, 'resolved pane targets must bind exact proof before effects');
+      assert.equal(request?.status, 'failed');
+      assert.equal(request?.last_reason, 'missing_tmux_target');
+      assert.equal(await readFile(tmuxLogPath, 'utf-8').catch(() => ''), '');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -2053,8 +2061,10 @@ exit 0
         '%42\t0\t4242', // readiness: capture
         '%42\t0\t4242', // send: initial identity check before HUD guard
         '%42\t0\t4242', // send: reproof after HUD guard before buffer setup
-        '%42\t0\t4242', // send: clear composer
-        '%42\t1\t4242', // send: paste buffer must be blocked
+        '%42\t0\t4242', // send: clear composer PID proof before owner read
+        '%42\t0\t4242', // send: clear composer final PID proof
+        '%42\t0\t4242', // send: paste buffer PID proof before owner read
+        '%42\t1\t4242', // send: paste buffer final proof must block
       ].join('\n'));
       process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
       process.env.OMX_TEST_EXACT_PANE_SEQUENCE_FILE = exactPaneSequencePath;
@@ -2089,9 +2099,12 @@ exit 0
       assert.match(commands[0] || '', exactGlobalPaneProof);
       assert.match(tmuxLog, /send-keys -t %42 C-u/, 'the live proof should permit the clear effect');
       assert.doesNotMatch(tmuxLog, /paste-buffer -t %42|send-keys -t %42 C-m/);
+      const ownerProof = 'show-option -qv -p -t %42 @omx_team_pane_owner_id';
       for (const [index, command] of commands.entries()) {
-        if (!/^(display-message|capture-pane|send-keys|paste-buffer)\b/.test(command) || !command.includes('-t %42')) continue;
-        assert.match(commands[index - 1] || '', exactGlobalPaneProof, `exact proof must immediately precede ${command}`);
+        if (!/^(send-keys|paste-buffer)\b/.test(command) || !command.includes('-t %42')) continue;
+        assert.match(commands[index - 1] || '', exactGlobalPaneProof, `final PID proof must immediately precede ${command}`);
+        assert.equal(commands[index - 2], ownerProof, `owner proof must precede final PID proof for ${command}`);
+        assert.match(commands[index - 3] || '', exactGlobalPaneProof, `initial PID proof must precede owner proof for ${command}`);
       }
       const lastProof = commands.map((command, index) => exactGlobalPaneProof.test(command) ? index : -1).filter((index) => index >= 0).at(-1);
       assert.notEqual(lastProof, undefined);

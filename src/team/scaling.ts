@@ -420,9 +420,11 @@ async function notifyWorkerPaneOutcome(
   paneId?: string,
   workerCli?: 'codex' | 'claude' | 'gemini',
   expectedPanePid?: number,
+  expectedTeamOwnerId?: string,
+  hudPaneId?: string,
 ): Promise<DispatchOutcome> {
   try {
-    await sendToWorker(sessionName, workerIndex, message, paneId, workerCli, expectedPanePid);
+    await sendToWorker(sessionName, workerIndex, message, paneId, workerCli, expectedPanePid, expectedTeamOwnerId, hudPaneId);
     return { ok: true, transport: 'tmux_send_keys', reason: 'tmux_send_keys_sent' };
   } catch (error) {
     return {
@@ -1031,8 +1033,24 @@ export async function scaleUp(
         );
       }
 
+      // The owner read is untrusted and may race pane-ID reuse. Bind the split
+      // to the same persisted process again immediately before the effect.
+      const finalSplitTargetProof = readExactPaneProofSync(splitTargetProof.paneId);
+      if (finalSplitTargetProof.status !== 'live') {
+        return await rollbackScaleUp(
+          `scale_up_split_target_proof_unavailable:${splitTargetProof.paneId}:${finalSplitTargetProof.reason}`,
+          { workerName, worktreePath: workerWorkspace?.worktreePath },
+        );
+      }
+      if (finalSplitTargetProof.pid !== expectedSplitTargetPid) {
+        return await rollbackScaleUp(
+          `scale_up_split_target_pid_changed:${splitTargetProof.paneId}:${expectedSplitTargetPid}:${finalSplitTargetProof.pid}`,
+          { workerName, worktreePath: workerWorkspace?.worktreePath },
+        );
+      }
+
       const result = spawnSync('tmux', [
-        'split-window', splitDirection, '-t', splitTargetProof.paneId, '-d', '-P', '-F', '#{pane_id}', '-c', workerCwd, cmd,
+        'split-window', splitDirection, '-t', finalSplitTargetProof.paneId, '-d', '-P', '-F', '#{pane_id}', '-c', workerCwd, cmd,
       ], { encoding: 'utf-8' });
 
       if (result.status !== 0) {
@@ -1098,7 +1116,7 @@ export async function scaleUp(
       const readyTimeoutMs = resolveWorkerReadyTimeoutMs(env);
       const skipReadyWait = env.OMX_TEAM_SKIP_READY_WAIT === '1';
       if (!skipReadyWait) {
-        const ready = waitForWorkerReady(sessionName, workerIndex, readyTimeoutMs, paneId, workerInfo.pid);
+        const ready = waitForWorkerReady(sessionName, workerIndex, readyTimeoutMs, paneId, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined);
         if (!ready) {
           console.log(`[omx:scaling] Warning: worker ${workerName} did not become ready within timeout`);
         }
@@ -1140,7 +1158,7 @@ export async function scaleUp(
           if (dispatchPolicy.dispatch_mode === 'hook_preferred_with_fallback') {
             return { ok: true, transport: 'hook', reason: 'queued_for_hook_dispatch' };
           }
-          return await notifyWorkerPaneOutcome(sessionName, workerIndex, message, paneId, workerCli, workerInfo.pid);
+          return await notifyWorkerPaneOutcome(sessionName, workerIndex, message, paneId, workerCli, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined);
         },
       });
       let outcome = queued;
@@ -1152,7 +1170,7 @@ export async function scaleUp(
         if (receipt && (receipt.status === 'notified' || receipt.status === 'delivered')) {
           outcome = { ok: true, transport: 'hook', reason: `hook_receipt_${receipt.status}`, request_id: queued.request_id };
         } else {
-          const fallback = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, paneId, workerCli, workerInfo.pid);
+          const fallback = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, paneId, workerCli, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined);
           if (receipt?.status === 'failed') {
             if (fallback.ok) {
               await transitionDispatchRequest(
@@ -1230,9 +1248,9 @@ export async function scaleUp(
         }
       }
       // Retry dispatch once if a trust prompt is blocking the worker pane (fixes #393).
-      if (!outcome.ok && dismissTrustPromptIfPresent(sessionName, workerIndex, paneId, workerInfo.pid)) {
-        waitForWorkerReady(sessionName, workerIndex, readyTimeoutMs, paneId, workerInfo.pid);
-        const retry = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, paneId, workerCli, workerInfo.pid);
+      if (!outcome.ok && dismissTrustPromptIfPresent(sessionName, workerIndex, paneId, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined)) {
+        waitForWorkerReady(sessionName, workerIndex, readyTimeoutMs, paneId, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined);
+        const retry = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, paneId, workerCli, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined);
         if (retry.ok) {
           outcome = retry;
         }

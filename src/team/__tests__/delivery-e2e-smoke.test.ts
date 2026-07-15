@@ -61,6 +61,13 @@ fi
 if [[ "$cmd" == "paste-buffer" ]]; then
   exit 0
 fi
+if [[ "$cmd" == "show-option" ]]; then
+  if [[ "$*" == *"@omx_team_pane_owner_id" ]]; then
+    echo "delivery-smoke-owner"
+    exit 0
+  fi
+  exit 1
+fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   fmt=""
@@ -107,9 +114,9 @@ if [[ "$cmd" == "send-keys" ]]; then
 fi
 if [[ "$cmd" == "list-panes" ]]; then
   if [[ "$#" -eq 3 && "$1" == "-a" && "$2" == "-F" && "$3" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
-    printf '%%10\t0\t111\n%%11\t0\t112\n%%12\t0\t113\n%%95\t0\t195\n'
+    printf '%%10\t0\t111\n%%11\t0\t112\n%%12\t0\t113\n%%95\t0\t195\n%%96\t0\t196\n'
   else
-    printf '%%10\t111\n%%11\t112\n%%12\t113\n%%95\t195\n'
+    printf '%%10\t111\n%%11\t112\n%%12\t113\n%%95\t195\n%%96\t196\n'
   fi
   exit 0
 fi
@@ -275,12 +282,16 @@ async function configurePaneIds(teamName: string, cwd: string, leaderPaneId: str
     '%11': 112,
     '%12': 113,
     '%95': 195,
+    '%96': 196,
   };
   const config = await readTeamConfig(teamName, cwd);
   assert.ok(config, 'missing team config');
   if (!config) throw new Error('missing team config');
   config.leader_pane_id = leaderPaneId;
   config.leader_pane_pid = panePids[leaderPaneId];
+  config.hud_pane_id = '%96';
+  config.hud_pane_pid = 196;
+  config.tmux_pane_owner_id = 'delivery-smoke-owner';
   config.workers = config.workers.map((worker) => {
     const paneId = workerPaneIds[worker.name] ?? worker.pane_id;
     return {

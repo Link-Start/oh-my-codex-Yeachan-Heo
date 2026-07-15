@@ -63,6 +63,8 @@ function runSendPaneInputInChild(params: {
   typePrompt: boolean;
   queueFirstSubmit?: boolean;
   exactPaneId?: string;
+  expectedPanePid?: number;
+  expectedPaneOwnerId?: string;
 }) {
   const payload = JSON.stringify({
     paneTarget: params.paneTarget,
@@ -72,6 +74,8 @@ function runSendPaneInputInChild(params: {
     typePrompt: params.typePrompt,
     queueFirstSubmit: params.queueFirstSubmit,
     exactPaneId: params.exactPaneId,
+    expectedPanePid: params.expectedPanePid,
+    expectedPaneOwnerId: params.expectedPaneOwnerId,
   });
   const script = `
     const input = ${payload};
@@ -719,6 +723,84 @@ fi
     assert.equal(parsed.ok, false);
     assert.equal(parsed.exactPaneProof.reason, 'pane_pid_changed');
     assert.doesNotMatch(await readFile(tmuxLogPath, 'utf8'), /send-keys/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+it('rejects a same-PID owner takeover before any Team pane input effect', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-owner-change-'));
+  const fakeBinDir = join(cwd, 'fake-bin');
+  const tmuxLogPath = join(cwd, 'tmux.log');
+  try {
+    await mkdir(fakeBinDir, { recursive: true });
+    await writeFile(join(fakeBinDir, 'tmux'), `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${tmuxLogPath}"
+if [ "$1" = "list-panes" ]; then printf '%%42\t0\t4242\n'; exit 0; fi
+if [ "$1" = "display-message" ]; then echo codex; exit 0; fi
+if [ "$1" = "show-option" ]; then echo team:foreign; exit 0; fi
+`);
+    await chmod(join(fakeBinDir, 'tmux'), 0o755);
+    const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+    const result = runSendPaneInputInChild({
+      fakeBinDir,
+      moduleUrl,
+      paneTarget: '%42',
+      exactPaneId: '%42',
+      expectedPanePid: 4242,
+      expectedPaneOwnerId: 'team:alpha',
+      prompt: 'must not send',
+      submitKeyPresses: 1,
+      typePrompt: false,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.ok, false);
+    assert.equal(parsed.exactPaneProof.reason, 'pane_owner_changed');
+    assert.doesNotMatch(await readFile(tmuxLogPath, 'utf8'), /send-keys|paste-buffer/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+it('rejects a replacement pane observed after a matching owner read', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-owner-replacement-'));
+  const fakeBinDir = join(cwd, 'fake-bin');
+  const tmuxLogPath = join(cwd, 'tmux.log');
+  const countPath = join(cwd, 'proof-count');
+  try {
+    await mkdir(fakeBinDir, { recursive: true });
+    await writeFile(join(fakeBinDir, 'tmux'), `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${tmuxLogPath}"
+if [ "$1" = "list-panes" ]; then
+  count=0; [ ! -f "${countPath}" ] || count=$(cat "${countPath}")
+  count=$((count + 1)); printf '%s' "$count" > "${countPath}"
+  if [ "$count" -le 3 ]; then printf '%%42\t0\t4242\n'; else printf '%%42\t0\t4343\n'; fi
+  exit 0
+fi
+if [ "$1" = "display-message" ]; then echo codex; exit 0; fi
+if [ "$1" = "show-option" ]; then echo team:alpha; exit 0; fi
+`);
+    await chmod(join(fakeBinDir, 'tmux'), 0o755);
+    const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+    const result = runSendPaneInputInChild({
+      fakeBinDir,
+      moduleUrl,
+      paneTarget: '%42',
+      exactPaneId: '%42',
+      expectedPanePid: 4242,
+      expectedPaneOwnerId: 'team:alpha',
+      prompt: 'must not send',
+      submitKeyPresses: 1,
+      typePrompt: false,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.ok, false);
+    assert.equal(parsed.exactPaneProof.reason, 'pane_pid_changed');
+    assert.doesNotMatch(await readFile(tmuxLogPath, 'utf8'), /send-keys|paste-buffer/);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

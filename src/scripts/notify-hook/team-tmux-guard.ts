@@ -98,6 +98,59 @@ export async function verifyExactPaneLive(exactPaneId: any, expectedPanePid?: nu
   }
 }
 
+export async function verifyExactPaneOwnerLive(exactPaneId: any, expectedPanePid: number | undefined, expectedPaneOwnerId: any): Promise<any> {
+  const expectedOwner = safeString(expectedPaneOwnerId).trim();
+  if (!expectedOwner || !Number.isInteger(expectedPanePid) || Number(expectedPanePid) <= 0) {
+    return {
+      ok: false,
+      reason: EXACT_PANE_UNAVAILABLE_REASON,
+      paneId: normalizeExactPaneId(exactPaneId),
+      proof: {
+        status: 'unavailable',
+        paneId: normalizeExactPaneId(exactPaneId),
+        reason: !expectedOwner ? 'missing_expected_pane_owner' : 'missing_expected_pane_pid',
+      },
+    };
+  }
+  const beforeOwner = await verifyExactPaneLive(exactPaneId, expectedPanePid);
+  if (!beforeOwner.ok) return beforeOwner;
+  try {
+    const ownerResult = await runProcess(
+      'tmux',
+      ['show-option', '-qv', '-p', '-t', beforeOwner.paneId, '@omx_team_pane_owner_id'],
+      3000,
+    );
+    const actualOwner = safeString(ownerResult.stdout).trim();
+    if (actualOwner !== expectedOwner) {
+      return {
+        ok: false,
+        reason: EXACT_PANE_UNAVAILABLE_REASON,
+        paneId: beforeOwner.paneId,
+        proof: {
+          status: 'unavailable',
+          paneId: beforeOwner.paneId,
+          reason: actualOwner ? 'pane_owner_changed' : 'pane_owner_unavailable',
+          expectedOwner,
+          actualOwner: actualOwner || undefined,
+        },
+      };
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      reason: EXACT_PANE_UNAVAILABLE_REASON,
+      paneId: beforeOwner.paneId,
+      proof: {
+        status: 'unavailable',
+        paneId: beforeOwner.paneId,
+        reason: 'pane_owner_unavailable',
+        detail: error instanceof Error ? error.message : safeString(error),
+      },
+    };
+  }
+  return verifyExactPaneLive(exactPaneId, expectedPanePid);
+}
+
 function exactPaneUnavailableResult(target: string, paneProof: any, extra: any = {}): any {
   return {
     ok: false,
@@ -312,6 +365,8 @@ export async function sendPaneInput({
   queueFirstSubmit = false,
   exactPaneId = undefined,
   expectedPanePid = undefined,
+  expectedPaneOwnerId = undefined,
+  expectedHudPaneId = undefined,
 }: any): Promise<any> {
   const target = safeString(paneTarget).trim();
   if (!target) {
@@ -328,6 +383,19 @@ export async function sendPaneInput({
     exactPaneProof = paneProof.proof || null;
     if (paneProof.ok && typeof paneProof.proof?.pid === 'number') pinnedPanePid ??= paneProof.proof.pid;
     return paneProof;
+  };
+  const expectedOwner = safeString(expectedPaneOwnerId).trim();
+  const expectedHudPane = normalizeExactPaneId(expectedHudPaneId);
+  if (expectedHudPane && expectedHudPane === exactPaneIdentity) {
+    return { ok: false, sent: false, reason: 'hud_pane_target', paneTarget: target };
+  }
+  const verifyForEffect = async () => {
+    if (expectedOwner) {
+      const paneProof = await verifyExactPaneOwnerLive(exactPaneIdentity, pinnedPanePid, expectedOwner);
+      exactPaneProof = paneProof.proof || null;
+      return paneProof;
+    }
+    return verifyExplicitPane();
   };
   const initialProof = await verifyExplicitPane();
   if (!initialProof.ok) return exactPaneUnavailableResult(target, initialProof);
@@ -420,7 +488,7 @@ export async function sendPaneInput({
         };
       }
 
-      const clearProof = await verifyExplicitPane();
+      const clearProof = await verifyForEffect();
       if (!clearProof.ok) return exactPaneUnavailableResult(target, clearProof, { argv });
       try {
         await runProcess('tmux', pasteArgv.clearComposerArgv, 3000);
@@ -436,7 +504,7 @@ export async function sendPaneInput({
         };
       }
 
-      const pasteProof = await verifyExplicitPane();
+      const pasteProof = await verifyForEffect();
       if (!pasteProof.ok) return exactPaneUnavailableResult(target, pasteProof, { argv });
       try {
         await runProcess('tmux', pasteArgv.pasteBufferArgv, 3000);
@@ -453,7 +521,7 @@ export async function sendPaneInput({
       }
     }
     if (queueFirstSubmit && argv.submitArgv.length > 0) {
-      const queueProof = await verifyExplicitPane();
+      const queueProof = await verifyForEffect();
       if (!queueProof.ok) return exactPaneUnavailableResult(target, queueProof, { argv });
       await runProcess('tmux', ['send-keys', '-t', target, 'Tab'], 3000);
       if (submitDelayMs > 0) {
@@ -464,7 +532,7 @@ export async function sendPaneInput({
       if (submitDelayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
       }
-      const submitProof = await verifyExplicitPane();
+      const submitProof = await verifyForEffect();
       if (!submitProof.ok) return exactPaneUnavailableResult(target, submitProof, { argv });
       await runProcess('tmux', submit, 3000);
     }

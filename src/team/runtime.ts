@@ -3599,7 +3599,7 @@ export async function startTeam(
       let startupReadyPromptObserved = false;
       if (workerLaunchMode === 'interactive' && !skipWorkerReadyWait && !initialPrompt && !startupDirectOutcome?.ok) {
         startupTiming.mark('ready_wait_start', { worker: workerName, pane_id: paneId });
-        const ready = await waitForWorkerReadyAsync(sessionName, workerIndex, workerReadyTimeoutMs, paneId, config!.workers[workerIndex - 1]?.pid);
+        const ready = await waitForWorkerReadyAsync(sessionName, workerIndex, workerReadyTimeoutMs, paneId, config!.workers[workerIndex - 1]?.pid, config!.tmux_pane_owner_id ?? undefined, config!.hud_pane_id ?? undefined);
         startupTiming.mark('ready_wait_end', { worker: workerName, pane_id: paneId, ok: ready });
         if (!ready) {
           const workerAlive = isWorkerPaneOpen(sessionName, workerIndex, paneId);
@@ -3661,8 +3661,8 @@ export async function startTeam(
           if (dispatchOutcome.ok) break;
           if (attempt < startupDispatchRetries) {
             if (workerLaunchMode === 'interactive') {
-              if (dismissTrustPromptIfPresent(sessionName, workerIndex, paneId, config!.workers[workerIndex - 1]?.pid)) {
-                await waitForWorkerReadyAsync(sessionName, workerIndex, workerReadyTimeoutMs, paneId, config!.workers[workerIndex - 1]?.pid);
+              if (dismissTrustPromptIfPresent(sessionName, workerIndex, paneId, config!.workers[workerIndex - 1]?.pid, config!.tmux_pane_owner_id ?? undefined, config!.hud_pane_id ?? undefined)) {
+                await waitForWorkerReadyAsync(sessionName, workerIndex, workerReadyTimeoutMs, paneId, config!.workers[workerIndex - 1]?.pid, config!.tmux_pane_owner_id ?? undefined, config!.hud_pane_id ?? undefined);
               } else {
                 await new Promise((resolve) => setTimeout(resolve, Math.max(0, startupRetryDelayS * 1000)));
               }
@@ -4289,13 +4289,15 @@ export async function assignTask(
       });
       if (outcome.ok) break;
       if (attempt < maxAssignRetries && config.worker_launch_mode === 'interactive' && config.tmux_session) {
-        if (dismissTrustPromptIfPresent(config.tmux_session, workerInfo.index, workerInfo.pane_id, workerInfo.pid)) {
+        if (dismissTrustPromptIfPresent(config.tmux_session, workerInfo.index, workerInfo.pane_id, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined)) {
           waitForWorkerReady(
             config.tmux_session,
             workerInfo.index,
             resolveWorkerReadyTimeoutMs(process.env),
             workerInfo.pane_id,
             workerInfo.pid,
+            config.tmux_pane_owner_id ?? undefined,
+            config.hud_pane_id ?? undefined,
           );
         } else {
           await new Promise<void>(r => setTimeout(r, assignRetryDelayS * 1000));
@@ -5332,7 +5334,7 @@ async function notifyWorkerOutcome(config: TeamConfig, workerIndex: number, mess
     return { ok: false, transport: 'tmux_send_keys', reason: 'tmux_unavailable' };
   }
   try {
-    await sendToWorker(config.tmux_session, workerIndex, message, workerPaneId, worker.worker_cli, worker.pid ?? undefined);
+    await sendToWorker(config.tmux_session, workerIndex, message, workerPaneId, worker.worker_cli, worker.pid ?? undefined, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined);
     return { ok: true, transport: 'tmux_send_keys', reason: 'tmux_send_keys_sent' };
   } catch (error) {
     return {

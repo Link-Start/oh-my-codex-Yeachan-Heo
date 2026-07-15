@@ -4565,7 +4565,7 @@ esac
     }
   });
 
-  it('surfaces partial worker metadata when proof is lost after create rollback kill', async () => {
+  it('preserves rollback debt when a successfully tagged pane owner changes before cleanup', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-partial-rollback-proof-'));
     const previousTmux = process.env.TMUX;
     const previousTmuxPane = process.env.TMUX_PANE;
@@ -4605,6 +4605,10 @@ case "$1" in
         if [ -f "${logPath}.worker" ]; then printf "%%1\\n%%2\\n"; else printf "%%1\\n"; fi
         ;;
     esac
+    exit 0
+    ;;
+  show-option)
+    if [ -f "${logPath}.worker" ]; then echo "team:foreign"; else echo "team:partial-rollback-proof"; fi
     exit 0
     ;;
   split-window)
@@ -4659,7 +4663,7 @@ esac
 
           const tmuxLog = await readFile(logPath, 'utf-8');
           assert.match(tmuxLog, /list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}/);
-          assert.match(tmuxLog, /kill-pane -t %2/);
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
         },
       );
     } finally {
@@ -4826,7 +4830,7 @@ case "$1" in
         if [ -f "${proofStatePath}" ]; then proof_count=$(cat "${proofStatePath}"); fi
         proof_count=$((proof_count + 1))
         printf '%s' "$proof_count" > "${proofStatePath}"
-        if [ "$proof_count" -eq 14 ]; then
+        if [ "$proof_count" -eq 15 ]; then
           printf 'not-a-pane-snapshot\n'
         else
           printf "%%11\t0\t2000000011\n%%44\t0\t2000000044\n"
@@ -6543,9 +6547,14 @@ case "$1" in
     printf '%s' "$count" > "$proof_count_file"
     if [ "$count" -eq 1 ]; then
       printf '%%9\t0\t2000000001\n'
+    elif [ "$count" -le 2 ]; then
+      printf '%%9\t0\t2000000001\n'
     else
       printf '%%9\t0\t2000000002\n'
     fi
+    ;;
+  show-option)
+    printf 'team:test\n'
     ;;
   capture-pane)
     cat <<'EOF'
@@ -6560,7 +6569,7 @@ esac
 `,
         async ({ logPath }) => {
           assert.throws(
-            () => dismissTrustPromptIfPresent('ignored-session', 1, '%9', 2000000001),
+            () => dismissTrustPromptIfPresent('ignored-session', 1, '%9', 2000000001, 'team:test', '%10'),
             /tmux pane identity changed: %9/,
           );
           const log = await readFile(logPath, 'utf-8');
@@ -6828,9 +6837,12 @@ case "$1" in
     if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
     count=$((count + 1))
     printf '%s' "$count" > "$count_file"
-    if [ "$count" -le 2 ]; then
+    if [ "$count" -le 4 ]; then
       printf '%%9\t0\t%s\n' "$PPID"
     fi
+    ;;
+  show-option)
+    printf 'team:test\n'
     ;;
   capture-pane)
     cat <<'EOF'
@@ -6845,7 +6857,7 @@ EOF
 esac
 `,
       async ({ logPath }) => {
-        await assert.rejects(() => sendToWorker('ignored-session', 1, 'check inbox', '%9', undefined, process.pid), /not proven live/);
+        await assert.rejects(() => sendToWorker('ignored-session', 1, 'check inbox', '%9', undefined, process.pid, 'team:test', '%10'), /not proven live/);
 
         const commands = (await readFile(logPath, 'utf-8')).trim().split('\n').filter(Boolean);
         const exactGlobalPaneProof = /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/;
@@ -6902,12 +6914,15 @@ EOF
       *" C-u") : > "$retry_file" ;;
     esac
     ;;
+  show-option)
+    printf 'team:test\n'
+    ;;
   *) exit 1 ;;
 esac
 `,
       async ({ logPath }) => {
         await assert.rejects(
-          () => sendToWorker('ignored-session', 1, 'check inbox', '%9', undefined, 2000000001),
+          () => sendToWorker('ignored-session', 1, 'check inbox', '%9', undefined, 2000000001, 'team:test', '%10'),
           /tmux pane identity changed: %9/,
         );
         const commands = await readFile(logPath, 'utf-8');
@@ -6918,6 +6933,53 @@ esac
           `the retry must not type into a reused pane:\n${commands}`,
         );
       },
+    );
+  });
+
+  it('rejects same-ID/PID owner takeover before worker input', async () => {
+    await withMockTmuxFixture(
+      'omx-exact-pane-send-owner-takeover-',
+      (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+owner_count="$state_dir/owner-count"
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  list-panes)
+    printf '%%9\t0\t%s\n' "$PPID"
+    ;;
+  show-option)
+    count=0
+    if [ -f "$owner_count" ]; then count=$(cat "$owner_count"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$owner_count"
+    if [ "$count" -eq 1 ]; then printf 'team:expected\n'; else printf 'team:foreign\n'; fi
+    ;;
+  capture-pane)
+    cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    ;;
+  send-keys)
+    ;;
+  *) exit 1 ;;
+esac
+`,
+      async ({ logPath }) => {
+        await assert.rejects(
+          () => sendToWorker('ignored-session', 1, 'check inbox', '%9', undefined, process.pid, 'team:expected', '%10'),
+          /team owner changed: %9/,
+        );
+        const commands = await readFile(logPath, 'utf-8');
+        assert.doesNotMatch(commands, /send-keys -t %9/);
+      },
+    );
+  });
+
+  it('rejects an explicit worker target equal to the canonical HUD pane', async () => {
+    await assert.rejects(
+      () => sendToWorker('ignored-session', 1, 'check inbox', '%9', undefined, process.pid, 'team:expected', '%9'),
+      /HUD target: %9/,
     );
   });
 
@@ -6935,10 +6997,11 @@ case "$1" in
     if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
     count=$((count + 1))
     printf '%s' "$count" > "$count_file"
-    if [ "$count" -le 4 ]; then
+    if [ "$count" -le 9 ]; then
       printf '%%9\t0\t%s\n' "$PPID"
     fi
     ;;
+  show-option) printf 'team:kill-test\n' ;;
   send-keys|kill-pane)
     ;;
   *)
@@ -6947,7 +7010,7 @@ case "$1" in
 esac
 `,
       async ({ logPath }) => {
-        await killWorker('ignored-session', 1, '%9', undefined, process.pid);
+        await killWorker('ignored-session', 1, '%9', undefined, process.pid, 'team:kill-test');
 
         const commands = (await readFile(logPath, 'utf-8')).trim().split('\n').filter(Boolean);
         const exactGlobalPaneProof = /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/;
@@ -6980,6 +7043,7 @@ case "$1" in
       printf '%%9\t0\t%s\n' "$PPID"
     fi
     ;;
+  show-option) printf 'team:kill-test\n' ;;
   send-keys)
     case "$*" in
       *" C-d") : > "$exit_file" ;;
@@ -6991,7 +7055,7 @@ esac
 `,
       async ({ logPath }) => {
         await assert.rejects(
-          () => killWorker('ignored-session', 1, '%9', undefined, process.pid),
+          () => killWorker('ignored-session', 1, '%9', undefined, process.pid, 'team:kill-test'),
           /tmux pane identity changed: %9/,
 
         );
@@ -7016,25 +7080,26 @@ case "$1" in
     if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
     count=$((count + 1))
     printf '%s' "$count" > "$count_file"
-    if [ "$count" -le 5 ]; then
+    if [ "$count" -le 10 ]; then
       printf '%%9\t0\t%s\n' "$PPID"
     else
       printf '%%9\t0\t999999999\n'
     fi
     ;;
+  show-option) printf 'team:kill-test\n' ;;
   send-keys|kill-pane) ;;
   *) exit 1 ;;
 esac
 `,
       async ({ logPath }) => {
-        await killWorker('ignored-session', 1, '%9', undefined, process.pid);
+        await killWorker('ignored-session', 1, '%9', undefined, process.pid, 'team:kill-test');
         const commands = await readFile(logPath, 'utf-8');
         assert.match(commands, /send-keys -t %9 C-c/);
         assert.match(commands, /send-keys -t %9 C-d/);
         assert.equal(
           (commands.match(/list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}/g) || []).length,
-          5,
-          `liveness must use its pinned proof rather than taking a second unconstrained proof:\n${commands}`,
+          10,
+          `liveness and effects must each use the pinned proof around owner authorization:\n${commands}`,
         );
       },
     );
@@ -7512,6 +7577,7 @@ esac`,
         const commands = (await readFile(logPath, 'utf-8')).trim().split('\n');
         assert.deepEqual(commands, [
           'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
+          'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
           'kill-pane -t %77',
           'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         ]);
@@ -7623,6 +7689,41 @@ if [ "$1" = "list-panes" ]; then printf '%%42\t0\t4343\n'; fi
         const summary = await teardownWorkerPanes(['%42'], {
           graceMs: 1,
           expectedPanePids: { '%42': 4242 },
+        });
+        assert.deepEqual(summary.proofUnavailable.map((proof) => proof.reason), ['pane_pid_changed']);
+        assert.doesNotMatch(await readFile(logPath, 'utf8'), /kill-pane/);
+      },
+    );
+  });
+
+  it('does not kill a replacement pane when owner authorization recycles its ID', async () => {
+    await withMockTmuxFixture(
+      'omx-teardown-owner-read-pid-reuse-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  list-panes)
+    if [ -f "${logPath}.owner-read" ]; then
+      printf '%%42\\t0\\t4343\\n'
+    else
+      printf '%%42\\t0\\t4242\\n'
+    fi
+    ;;
+  show-options)
+    : > "${logPath}.owner-read"
+    echo 'team:owned'
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        const summary = await teardownWorkerPanes(['%42'], {
+          graceMs: 1,
+          expectedPanePids: { '%42': 4242 },
+          authorizePaneKill: () => {
+            spawnSync('tmux', ['show-options', '-p', '-t', '%42', '@omx_team_pane_owner_id']);
+            return true;
+          },
         });
         assert.deepEqual(summary.proofUnavailable.map((proof) => proof.reason), ['pane_pid_changed']);
         assert.doesNotMatch(await readFile(logPath, 'utf8'), /kill-pane/);

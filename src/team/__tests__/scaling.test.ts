@@ -1056,7 +1056,7 @@ printf '%s\\n' "$@" > '${capturePath}'
           '    if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi',
           '    count=$((count + 1))',
           '    printf "%s" "$count" > "$count_file"',
-          '    if [ "$count" -le 4 ]; then',
+          '    if [ "$count" -le 5 ]; then',
           "      printf '%s\\t%s\\t%s\\n' '%11' '0' '42411'",
           "      printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
           "      printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'",
@@ -1149,10 +1149,10 @@ printf '%s\\n' "$@" > '${capturePath}'
         `    count_file="${join(fakeBinDir, 'proof-count')}"`,
         '    count=0; [ ! -f "$count_file" ] || count=$(cat "$count_file")',
         '    count=$((count + 1)); printf "%s" "$count" > "$count_file"',
-        '    if [ "$count" -le 3 ]; then',
+        '    if [ "$count" -le 4 ]; then',
         "      printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
         "      printf '%s\\t%s\\t%s\\n' '%31' '0' '42424'",
-        '    elif [ "$count" -eq 4 ]; then',
+        '    elif [ "$count" -eq 5 ]; then',
         "      printf '%s\\t%s\\t%s\\n' '%21' '0' '42421'",
         "      printf '%s\\t%s\\t%s\\n' '%31' '0' '52424'",
         '    else',
@@ -2226,9 +2226,10 @@ exit 0
 
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       const splitWindowIndex = tmuxCommands.findIndex((command) => command.startsWith('split-window '));
-      assert.ok(splitWindowIndex > 1);
-      assert.equal(tmuxCommands[splitWindowIndex - 1], 'show-option -qv -p -t %21 @omx_team_pane_owner_id');
-      assert.match(tmuxCommands[splitWindowIndex - 2]!, /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/);
+      assert.ok(splitWindowIndex > 2);
+      assert.match(tmuxCommands[splitWindowIndex - 3]!, /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/);
+      assert.equal(tmuxCommands[splitWindowIndex - 2], 'show-option -qv -p -t %21 @omx_team_pane_owner_id');
+      assert.match(tmuxCommands[splitWindowIndex - 1]!, /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/);
       assert.match(tmuxCommands[splitWindowIndex]!, /split-window -v -t %21/);
       assert.doesNotMatch(tmuxCommands.join('\n'), /select-layout .*tiled/);
 
@@ -2469,7 +2470,7 @@ exit 0
     }
   });
 
-  it('rolls back all preparation when the split target pane ID is PID-reused before split-window', async () => {
+  it('rejects a split target ID replacement that occurs during owner authorization', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-up-split-target-pid-reuse-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-up-split-target-pid-reuse-bin-'));
     const tmuxLogPath = join(fakeBinDir, 'tmux.log');
@@ -2964,13 +2965,15 @@ esac
           command === mutationCommand || command.startsWith(`${mutationCommand} -c `)
         ));
         if (mutationCommand.startsWith('split-window ')) {
-          assert.ok(mutationIndex > 1);
-          assert.match(tmuxCommands[mutationIndex - 1]!, /^show-option -qv -p -t %(?:21|31) @omx_team_pane_owner_id$/);
-          assert.equal(tmuxCommands[mutationIndex - 2], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
+          assert.ok(mutationIndex > 2);
+          assert.equal(tmuxCommands[mutationIndex - 3], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
+          assert.match(tmuxCommands[mutationIndex - 2]!, /^show-option -qv -p -t %(?:21|31) @omx_team_pane_owner_id$/);
+          assert.equal(tmuxCommands[mutationIndex - 1], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
         } else {
-          assert.ok(mutationIndex > 1);
-          assert.equal(tmuxCommands[mutationIndex - 2], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
-          assert.equal(tmuxCommands[mutationIndex - 1], 'show-option -qv -p -t %31 @omx_team_pane_owner_id');
+          assert.ok(mutationIndex > 2);
+          assert.equal(tmuxCommands[mutationIndex - 3], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
+          assert.equal(tmuxCommands[mutationIndex - 2], 'show-option -qv -p -t %31 @omx_team_pane_owner_id');
+          assert.equal(tmuxCommands[mutationIndex - 1], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
         }
       }
       assert.ok(tmuxCommands.some((command) => command.startsWith('split-window -v -t %21 ')));
@@ -3452,6 +3455,7 @@ exit 0
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'show-option -qv -p -t %13 @omx_team_pane_owner_id',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %13',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
       ]);
@@ -3545,6 +3549,7 @@ exit 0
       assert.deepEqual(tmuxCommands, [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'show-option -qv -p -t %13 @omx_team_pane_owner_id',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %13',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
       ]);
@@ -3911,9 +3916,10 @@ exit 0
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.deepEqual(tmuxCommands.filter((command) => command.startsWith('kill-pane ')), ['kill-pane -t %13']);
       const killIndex = tmuxCommands.indexOf('kill-pane -t %13');
-      assert.ok(killIndex > 1);
-      assert.equal(tmuxCommands[killIndex - 2], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
-      assert.equal(tmuxCommands[killIndex - 1], 'show-option -qv -p -t %13 @omx_team_pane_owner_id');
+      assert.ok(killIndex > 2);
+      assert.equal(tmuxCommands[killIndex - 3], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
+      assert.equal(tmuxCommands[killIndex - 2], 'show-option -qv -p -t %13 @omx_team_pane_owner_id');
+      assert.equal(tmuxCommands[killIndex - 1], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
       assert.equal(tmuxCommands[killIndex + 1], 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}');
       await writeFile(`${proofLossMarkerPath}.recovery`, '1');
       await rm(`${proofLossMarkerPath}.killed`, { force: true });
@@ -4011,10 +4017,12 @@ esac
       assert.deepEqual(await readScaleUpTmuxLogCommands(tmuxLogPath), [
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'show-option -qv -p -t %13 @omx_team_pane_owner_id',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %13',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'show-option -qv -p -t %14 @omx_team_pane_owner_id',
+        'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}',
         'kill-pane -t %14',
       ]);
     } finally {
